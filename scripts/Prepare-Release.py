@@ -11,7 +11,7 @@ FILES = ('run.py', 'Start.bat', 'requirements.txt', 'requirements-analysis.txt',
          'frontend/index.html', 'frontend/demo.html', 'frontend/research-demo.html',
          'frontend/package.json', 'frontend/package-lock.json', 'frontend/tsconfig.json',
          'frontend/vite.config.ts', 'docs/OPEN_SOURCE_REVIEW.md', 'docs/RELEASE_NOTES.md',
-         'docs/WINDOWS_INSTALL.md', 'docs/PUBLIC_README.md', '.gitignore')
+         'docs/WINDOWS_INSTALL.md', 'docs/MAC_INSTALL.md', 'docs/PUBLIC_README.md', '.gitignore')
 PATTERNS = [re.compile(r'sk-[A-Za-z0-9_-]{20,}'), re.compile(r'SCT\d+[A-Za-z0-9]{16,}'),
             re.compile(r'gh[pousr]_[A-Za-z0-9]{20,}'), re.compile(r'github_pat_[A-Za-z0-9_]{20,}')]
 

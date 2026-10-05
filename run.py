@@ -17,7 +17,7 @@ def launch(headless=False, port=8765):
 
 
 def _launch(headless=False, port=8765):
-    if sys.platform != "win32" and not os.getenv("WEALTH_DATA_DIR"):
+    if sys.platform != "win32" and not getattr(sys, "frozen", False) and not os.getenv("WEALTH_DATA_DIR"):
         os.environ["WEALTH_DATA_DIR"] = str(Path(__file__).resolve().parent / "data")
     # Check before opening a database or starting scheduled jobs.
     import socket

@@ -17,6 +17,8 @@ def default_data_dir():
         return Path(os.environ["WEALTH_DATA_DIR"]).expanduser()
     if sys.platform == "win32":
         return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "RetirementWealth"
+    if sys.platform == "darwin" and getattr(sys, "frozen", False):
+        return Path.home() / "Library" / "Application Support" / "InvestmentInfo"
     return Path.home() / ".retirement-wealth"
 
 
