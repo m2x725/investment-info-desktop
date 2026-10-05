@@ -14,7 +14,7 @@ def test_export_excludes_account_and_local_artifacts(tmp_path):
         p = tmp_path / name
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text('test')
-    files = [str(p.relative_to(tmp_path)) for p in release.release_files(tmp_path)]
+    files = [p.relative_to(tmp_path).as_posix() for p in release.release_files(tmp_path)]
     assert files == ['backend/main.py', 'frontend/src/main.tsx']
 
 
