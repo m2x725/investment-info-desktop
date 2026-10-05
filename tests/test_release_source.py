@@ -10,7 +10,7 @@ spec.loader.exec_module(release)
 def test_export_excludes_account_and_local_artifacts(tmp_path):
     for name in ['backend/main.py', 'frontend/src/main.tsx', 'data/portfolio.db',
                  '.env', '.venv/private.py', 'docs/desktop-preview/window.png',
-                 'backend/__pycache__/main.pyc', ':memory:.ses']:
+                 'backend/__pycache__/main.pyc', 'session.ses']:
         p = tmp_path / name
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text('test')

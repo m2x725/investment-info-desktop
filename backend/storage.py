@@ -3,7 +3,7 @@ import json
 import os
 import sqlite3
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -146,6 +146,6 @@ class Store:
         folder = self.directory / "backups"
         folder.mkdir(exist_ok=True)
         target = folder / f'portfolio-{datetime.now().strftime("%Y%m%d-%H%M%S-%f")}.db'
-        with self.connect() as db, sqlite3.connect(target) as dest:
+        with self.connect() as db, closing(sqlite3.connect(target)) as dest:
             db.backup(dest)
         return target

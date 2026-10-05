@@ -16,7 +16,7 @@ def test_rss_identity_date_and_plain_description():
     assert publisher('https://evilgov.hk/a')[1]=='media'
     assert publisher('https://www.hkexnews.hk/a')[1]=='official'
 
-@pytest.mark.parametrize('xml',[b'<!DOCTYPE foo><rss/>',b'<!ENTITY x "test"><rss/>',b'x'*2_000_001])
+@pytest.mark.parametrize('xml',[b'<!DOCTYPE foo><rss/>',b'<!ENTITY x "test"><rss/>',b'x'*2_000_001], ids=['doctype', 'entity', 'oversized'])
 def test_reject_xml_expansion_and_unbounded_feed(xml):
     with pytest.raises(ValueError):parse_feed(xml)
 

@@ -215,7 +215,7 @@ def test_restore_validation_and_preserved_pre_restore_copy(svc,tmp_path):
     assert svc.store.path.read_bytes()==before
 
 def test_folder_detection_previews_once_never_commits(svc,tmp_path):
-    folder=tmp_path/'exports';folder.mkdir();(folder/'持仓.csv').write_text('证券代码,名称,持仓数量,成本价\n00700,测试,5,-1\n')
+    folder=tmp_path/'exports';folder.mkdir();(folder/'持仓.csv').write_text('证券代码,名称,持仓数量,成本价\n00700,测试,5,-1\n', encoding='utf-8')
     svc.store.save_settings({'import_folder':str(folder)})
     svc.scan_import_folder();svc.scan_import_folder()
     assert len(svc.store.rows('SELECT * FROM imports'))==1
