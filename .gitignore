@@ -1,0 +1,25 @@
+.venv/
+node_modules/
+frontend/dist/
+__pycache__/
+.pytest_cache/
+.env
+data/
+build/
+dist/
+output/
+.playwright-cli/
+*.log
+*.spec
+
+
+# Local chat and account artifacts are never source releases
+.impeccable/
+:memory:*
+.DS_Store
+*.db
+*.sqlite
+*.sqlite3
+*.ses
+release-source/
+docs/*preview/

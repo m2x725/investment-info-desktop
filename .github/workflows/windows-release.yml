@@ -1,0 +1,72 @@
+name: Windows installer
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version, for example 0.1.0'
+        required: true
+        default: '0.1.0'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Validate version and source
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          if ($env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+$') { throw 'Use a numeric version such as 0.1.0.' }
+          python scripts/Prepare-Release.py --check
+      - name: Install dependencies and build frontend
+        run: |
+          ./scripts/Setup-Windows.ps1
+          & ./.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Test dependencies failed.' }
+      - name: Tests
+        run: |
+          & ./.venv/Scripts/python.exe -m pytest -q
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
+      - name: Build desktop bundle
+        run: ./scripts/Build-Windows.ps1
+      - name: Packaged backend smoke test
+        run: ./scripts/Smoke-Windows.ps1
+      - name: Build installer
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          ./scripts/Build-Installer.ps1 -Version $env:RELEASE_VERSION
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-${{ inputs.version }}
+          path: |
+            dist/InvestmentInfo-*-Setup.exe
+            dist/RetirementWealth-Windows.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          $tag = "v$env:RELEASE_VERSION"
+          $assets = @((Get-ChildItem dist/InvestmentInfo-*-Setup.exe).FullName,
+                      (Resolve-Path dist/RetirementWealth-Windows.zip).Path,
+                      (Resolve-Path dist/SHA256SUMS.txt).Path)
+          gh release create $tag @assets --target $env:GITHUB_SHA --draft --title "投资信息台 $tag（待实机验收）" --notes-file docs/RELEASE_NOTES.md
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed. Use a new version when retrying an existing release.' }

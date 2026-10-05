@@ -1,0 +1,6 @@
+-r requirements.txt
+akshare>=1.18,<2
+riskfolio-lib>=7,<8
+futu-api>=9,<11
+rapidocr-onnxruntime>=1.4,<2
+pypdfium2>=4.30,<5
