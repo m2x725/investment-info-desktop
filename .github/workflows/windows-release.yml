@@ -40,7 +40,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Test dependencies failed.' }
       - name: Tests
         run: |
-          & ./.venv/Scripts/python.exe -m pytest -q
+          & ./.venv/Scripts/python.exe -m pytest tests -q --tb=short
           if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
       - name: Build desktop bundle
         run: ./scripts/Build-Windows.ps1
