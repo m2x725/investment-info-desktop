@@ -49,6 +49,7 @@ function App(){
   async function load(){
     const d=await api('/bootstrap');setData(d);setConfig((old:any)=>old||d.settings);
     setSelected(old=>d.followed.some((s:Security)=>s.id===old)?old:(d.followed[0]?.id||''));
+    return d;
   }
   useEffect(()=>{load().catch(e=>setError(e.message));},[]);
   useEffect(()=>{
@@ -73,7 +74,7 @@ function App(){
         if(!active)return;
         if((j.status==='running'||j.status==='queued')&&j.message)setTask(current=>current?.id===task.id?{...current,detail:j.message,progress:j.progress}:current);
         if(j.status==='cancelling')setTask(current=>current?.id===task.id?{...current,cancelling:true,detail:j.message}:current);
-        if(j.status==='cancelled'){clearInterval(timer);await load();if(active){setTask(null);setCompletedResult(null);setNotice('已取消，本次报告与草稿未保存。');}return;}
+        if(j.status==='cancelled'){clearInterval(timer);const fresh=await load();if(active){setTask(null);setCompletedResult(null);setReport((current:any)=>current&& !fresh.reports.some((r:any)=>r.id===current.id)?null:current);setNotice('已取消，本次报告与草稿未保存。');}return;}
         if(j.status==='done'||j.status==='failed'){
           clearInterval(timer);await load();
           if(j.status==='failed')setError(j.message);
