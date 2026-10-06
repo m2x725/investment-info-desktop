@@ -46,6 +46,10 @@ jobs:
         run: ./scripts/Build-Windows.ps1
       - name: Packaged backend smoke test
         run: ./scripts/Smoke-Windows.ps1
+      - name: Packaged PDF worker smoke test
+        run: |
+          & ./.venv/Scripts/python.exe scripts/Smoke-PDF.py dist/RetirementWealth/RetirementWealth.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen PDF worker failed.' }
       - name: Build installer
         env:
           RELEASE_VERSION: ${{ inputs.version }}

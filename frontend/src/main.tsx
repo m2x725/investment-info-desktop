@@ -30,7 +30,7 @@ function App(){
   const [editing,setEditing]=useState<any>(null),[showHolding,setShowHolding]=useState(false);
   const [evidence,setEvidence]=useState<any[]>([]),[showEvidence,setShowEvidence]=useState(false);
   const [credentialForm,setCredentialForm]=useState({kimi_key:'',push_key:''});
-  const [task,setTask]=useState<{id:string;label:string;completion?:string}|null>(null);
+  const [task,setTask]=useState<{id:string;label:string;completion?:string;detail?:string}|null>(null);
   const [removeId,setRemoveId]=useState('');
   const [feedbackHeight,setFeedbackHeight]=useState(0);
   const [completedResult,setCompletedResult]=useState<any>(null);
@@ -71,6 +71,7 @@ function App(){
       try{
         const j=await api('/jobs/'+task.id);
         if(!active)return;
+        if(j.status==='running'&&j.message)setTask(current=>current?.id===task.id?{...current,detail:j.message}:current);
         if(j.status==='done'||j.status==='failed'){
           clearInterval(timer);await load();
           if(j.status==='failed')setError(j.message);
@@ -143,7 +144,7 @@ function App(){
       <button className={page==='settings'?'nav active settings-nav':'nav settings-nav'} onClick={()=>navigate('settings')}><Settings2 size={19}/>维护设置</button>
     </aside>
     <main>
-      <FeedbackDock error={error} notice={notice} progress={task?task.label+'，请稍候。可以继续阅读已有资料。':pending?pending+'…':''} onErrorClose={()=>setError('')} onNoticeClose={()=>{setNotice('');setCompletedResult(null)}} onViewResult={completedResult?viewCompletedResult:undefined} onHeight={setFeedbackHeight}/>
+      <FeedbackDock error={error} notice={notice} progress={task?(task.detail||task.label)+'，请稍候。可以继续阅读已有资料。':pending?pending+'…':''} onErrorClose={()=>setError('')} onNoticeClose={()=>{setNotice('');setCompletedResult(null)}} onViewResult={completedResult?viewCompletedResult:undefined} onHeight={setFeedbackHeight}/>
       {feedbackHeight>0&&<div className="feedback-spacer" aria-hidden="true" style={{height:feedbackHeight}}/>}
       <header className="topline"><span>{new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'long',day:'numeric',weekday:'long'}).format(new Date())}</span><span className="local-state"><span/>本机运行</span></header>
       {page==='home'&&<>

@@ -217,6 +217,7 @@ class Services:
         self.research_lock = threading.Lock()
         self.collector=Collector(market)
         self.collection_locks={}
+        self.job_context=threading.local()
         self.stop = threading.Event()
         self.scheduler = None
 
@@ -352,6 +353,7 @@ class Services:
         def run():
             self.store.execute("UPDATE jobs SET status='running',message='正在处理，请稍候' WHERE id=?", (jid,))
             try:
+                self.job_context.id = jid
                 result = func()
                 self.store.execute("UPDATE jobs SET status='done',message='已完成',result_id=? WHERE id=?",
                                    (result if isinstance(result, int) else None, jid))
@@ -359,6 +361,8 @@ class Services:
                 message = str(exc) if isinstance(exc, ProviderError) else "任务未完成，请到维护设置查看状态后重试。"
                 self.store.execute("UPDATE jobs SET status='failed',message=? WHERE id=?", (message, jid))
                 self.store.event(kind, message)
+            finally:
+                self.job_context.id = None
         self.executor.submit(run)
         return jid
 
@@ -532,6 +536,12 @@ class Services:
                 parts.append(marker+"\n"+content[start:start+600])
         return "\n\n[资料节选，可能不完整]\n".join(parts)[:4000]
 
+    def collection_progress(self, sid, message):
+        self.store.save_settings({'collection:'+sid: {'status':'running','checked_at':utcnow(),'message':message}})
+        jid = getattr(self.job_context, 'id', None)
+        if jid:
+            self.store.execute("UPDATE jobs SET message=? WHERE id=?", (message,jid))
+
     def collect_company(self,sid,quote=True):
         lock=self.collection_locks.setdefault(sid,threading.Lock())
         with lock:
@@ -539,6 +549,7 @@ class Services:
             if not rows:raise ProviderError("公司不存在。")
             s=rows[0];failures=[];downloaded=0
             self.store.save_settings({"collection:"+sid:{"status":"running","checked_at":utcnow(),"message":"正在自动查找财报和公告"}})
+            self.collection_progress(sid,"正在更新行情")
             if quote:
                 try:
                     q=self.market.quote(s)
@@ -546,6 +557,7 @@ class Services:
                     save_quote(self.store,sid,q)
                 except Exception:failures.append("行情未更新")
             try:
+                self.collection_progress(sid,"正在查询交易所公告与财报目录")
                 documents=self.collector.documents(s)
                 for index,e in enumerate(documents):
                     previous=self.store.rows("SELECT * FROM evidence WHERE security_id=? AND url=? AND title=?",(sid,e["url"],e["title"]))
@@ -557,6 +569,7 @@ class Services:
                             " VALUES(?,?,?,?,?,?,?,?)",(sid,e['title'],e['url'],e['published_at'],e['title'],e['kind'],'title_only',utcnow()))
                         continue
                     try:
+                        self.collection_progress(sid,f"读取原文 {index+1}/{min(6,len(documents))}：{e['title']}（单份解析最多60秒）")
                         content=self.market.official_text(e["url"])
                         values=(sid,e["title"],e["url"],e["published_at"],content,e["kind"],"official_download",utcnow(),
                                 "官方PDF自动读取；按页保存，部分页可能使用备用解析/OCR")
@@ -567,13 +580,14 @@ class Services:
                             self.store.execute("INSERT INTO evidence(security_id,title,url,published_at,content,kind,verification,fetched_at,locator)"
                                                " VALUES(?,?,?,?,?,?,?,?,?)",values)
                         downloaded+=1
-                    except Exception:
-                        failures.append(e["title"]+"：原文读取失败")
+                    except Exception as exc:
+                        failures.append(e["title"]+"："+(str(exc) if isinstance(exc,ProviderError) else "原文读取失败"))
                         self.store.execute("INSERT OR IGNORE INTO evidence(security_id,title,url,published_at,content,kind,verification,fetched_at)"
                                            " VALUES(?,?,?,?,?,?,?,?)",(sid,e["title"],e["url"],e["published_at"],e["title"],e["kind"],"title_only",utcnow()))
             except Exception as exc:
                 failures.append(str(exc) if isinstance(exc,ProviderError) else "官方财报与公告查询未完成")
             try:
+                self.collection_progress(sid,"正在查询结构化财务数据")
                 f=self.collector.financials(s)
                 content=json.dumps(f,ensure_ascii=False)
                 previous=self.store.rows("SELECT id FROM evidence WHERE security_id=? AND verification='aggregated' AND content=?",(sid,content))

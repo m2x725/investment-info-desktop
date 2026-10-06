@@ -174,10 +174,14 @@ class Market:
         if parsed.scheme != "https" or host not in allowed or parsed.netloc.lower() not in approved_netlocs:
             raise ProviderError("自动导入仅接受巨潮、交易所或披露易的官方 PDF 直链；其他资料请粘贴原文。")
         try:
+            import time
+            download_started = time.monotonic()
             with self.client.stream("GET", url) as r:
                 r.raise_for_status()
                 parts, size = [], 0
                 for part in r.iter_bytes():
+                    if time.monotonic()-download_started > 60:
+                        raise ProviderError("PDF下载超时，保留来源链接并继续其他资料。")
                     size += len(part)
                     if size > 32 * 1024 * 1024:
                         raise ProviderError("PDF大于32MB，系统需改用官方网页或关键章节。")

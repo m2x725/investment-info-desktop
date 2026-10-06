@@ -4,6 +4,12 @@ import sys
 import threading
 import time
 from pathlib import Path
+# Frozen subprocesses must enter the worker before importing or starting the app.
+if '--pdf-worker' in sys.argv:
+    from backend.pdf_worker import main as pdf_main
+    pdf_main()
+    raise SystemExit(0)
+
 import uvicorn
 from backend.main import create_app
 
