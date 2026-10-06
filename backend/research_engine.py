@@ -173,6 +173,7 @@ class ResearchEngine:
         except Exception:warnings.append('官方资料更新失败，继续使用可读缓存和联网检索。')
         try:self.svc.collect_financial_history(sid)
         except Exception:warnings.append('结构化历史财务表未更新；保留官方报告和明确缺口。')
+        self.svc.job_progress("正在联网搜索并补充研究资料")
         try:warnings+=self.retrieve(security,run)
         except Exception:warnings.append('联网检索未完成，已保留研究断点。')
         evidence=self.store.rows("SELECT * FROM evidence WHERE security_id=? AND verification!='title_only' ORDER BY published_at DESC",(sid,))
@@ -201,6 +202,7 @@ class ResearchEngine:
             continuation=json.loads(previous[0]['payload']) if previous and previous[0]['status']=='partial' else None
             self.store.execute('INSERT OR REPLACE INTO research_sections VALUES(?,?,?,?)',(run,key,'{}','uncertain'))
             try:
+                self.svc.job_progress("AI正在分析："+label)
                 payload=self.svc.ai_call([{'role':'system','content':SYSTEM+'\n采用研究模板 '+TEMPLATE_VERSION+'。只完成当前章节，完整分析证据、推论、假设及缺口，不写交易指令。'}, {'role':'user','content':json.dumps({'company':security,'as_of':run_snapshot['as_of'],'question':question,'chapter':label,'materials':materials,'calculation':calculation,'completed_chapters':[{ 'chapter':s['label'],'summary':context_text(s['report']['summary'])} for s in sections] if key=='countercase' else [],'continuation':{'summary':context_text(continuation['summary'],20000),'saved_characters':len(continuation['summary'])} if continuation else None,'instruction':'若continuation有内容，仅续写缺失部分，避免重复已保存内容'},ensure_ascii=False)}])
                 checked=self.svc.validate_output(payload,good,calculation,sid,key)
                 if continuation:

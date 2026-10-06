@@ -280,6 +280,7 @@ class Services:
         s=self.store.rows('SELECT * FROM securities WHERE id=?',(sid,))[0]
         # Attempt is recorded so a provider outage cannot start endless repeated network calls.
         self.store.save_settings({'financial_history:'+sid:utcnow()})
+        self.job_progress("正在补充历史财务表（最多45秒，失败后继续其他资料）")
         collect_financial_history(self.store,s)
 
     def refresh_fx(self, force=False, now=None):
@@ -538,6 +539,9 @@ class Services:
 
     def collection_progress(self, sid, message):
         self.store.save_settings({'collection:'+sid: {'status':'running','checked_at':utcnow(),'message':message}})
+        self.job_progress(message)
+
+    def job_progress(self, message):
         jid = getattr(self.job_context, 'id', None)
         if jid:
             self.store.execute("UPDATE jobs SET message=? WHERE id=?", (message,jid))

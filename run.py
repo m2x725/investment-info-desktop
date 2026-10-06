@@ -10,6 +10,11 @@ if '--pdf-worker' in sys.argv:
     pdf_main()
     raise SystemExit(0)
 
+if '--financial-worker' in sys.argv:
+    from backend.history_worker import main as history_main
+    history_main()
+    raise SystemExit(0)
+
 import uvicorn
 from backend.main import create_app
 

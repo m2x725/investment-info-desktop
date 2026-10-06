@@ -33,29 +33,46 @@ def collect_history(store,s):
         return {'count':len(frame)}
     except Exception as exc:raise ProviderError('历史行情接口未完成；未生成统计风险数据。') from exc
 
+def _fetch_financial_history(s):
+    import json
+    import akshare as ak
+    statements={}
+    if s['exchange']=='HK':
+        for name in ('资产负债表','利润表','现金流量表'):
+            frame=ak.stock_financial_hk_report_em(stock=s['ticker'],symbol=name,indicator='年度')
+            if not frame.empty and any(str(c).zfill(5)!=s['ticker'] for c in frame['SECURITY_CODE'].unique()):raise ValueError('identity')
+            records=json.loads(frame.to_json(orient='records',date_format='iso',force_ascii=False))
+            for r in records:
+                period=str(r.get('REPORT_DATE',''))[:10]
+                if not period:continue
+                statements.setdefault(period,{}).setdefault(name,[]).append(r)
+    else:
+        for name,method in (('资产负债表',ak.stock_balance_sheet_by_report_em),('利润表',ak.stock_profit_sheet_by_report_em),('现金流量表',ak.stock_cash_flow_sheet_by_report_em)):
+            frame=method(symbol=s['exchange']+s['ticker'])
+            records=json.loads(frame.to_json(orient='records',date_format='iso',force_ascii=False))
+            for r in records:
+                if r.get('SECUCODE')!=s['ticker']+'.'+s['exchange']:continue
+                period=str(r.get('REPORT_DATE',''))[:10]
+                statements.setdefault(period,{}).setdefault(name,[]).append(r)
+    return statements
+
 def collect_financial_history(store,s):
     """Save raw statement rows with identity; unconfirmed historical currency stays unknown."""
     import json
     try:
-        import akshare as ak
-        statements={}
-        if s['exchange']=='HK':
-            for name in ('资产负债表','利润表','现金流量表'):
-                frame=ak.stock_financial_hk_report_em(stock=s['ticker'],symbol=name,indicator='年度')
-                if not frame.empty and any(str(c).zfill(5)!=s['ticker'] for c in frame['SECURITY_CODE'].unique()):raise ValueError('identity')
-                records=json.loads(frame.to_json(orient='records',date_format='iso',force_ascii=False))
-                for r in records:
-                    period=str(r.get('REPORT_DATE',''))[:10]
-                    if not period:continue
-                    statements.setdefault(period,{}).setdefault(name,[]).append(r)
-        else:
-            for name,method in (('资产负债表',ak.stock_balance_sheet_by_report_em),('利润表',ak.stock_profit_sheet_by_report_em),('现金流量表',ak.stock_cash_flow_sheet_by_report_em)):
-                frame=method(symbol=s['exchange']+s['ticker'])
-                records=json.loads(frame.to_json(orient='records',date_format='iso',force_ascii=False))
-                for r in records:
-                    if r.get('SECUCODE')!=s['ticker']+'.'+s['exchange']:continue
-                    period=str(r.get('REPORT_DATE',''))[:10]
-                    statements.setdefault(period,{}).setdefault(name,[]).append(r)
+        import os, subprocess, sys, tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory(prefix='wealth-history-') as directory:
+            source=Path(directory)/'security.json';output=Path(directory)/'result.json'
+            source.write_text(json.dumps(dict(s),ensure_ascii=False),encoding='utf-8')
+            command=([sys.executable,'--financial-worker'] if getattr(sys,'frozen',False)
+                     else [sys.executable,'-m','backend.history_worker'])
+            options={'creationflags':subprocess.CREATE_NO_WINDOW} if sys.platform=='win32' else {}
+            env={**os.environ,'OMP_NUM_THREADS':'2','OPENBLAS_NUM_THREADS':'2','MKL_NUM_THREADS':'2'}
+            result=subprocess.run(command+[str(source),str(output)],timeout=45,env=env,
+                                  stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,**options)
+            if result.returncode or not output.exists():raise ValueError('history worker failed')
+            statements=json.loads(output.read_text(encoding='utf-8'))
         for period in sorted(statements,reverse=True)[:4]:
             payload={'statements':statements[period],'currency':'UNKNOWN' if s['exchange']=='HK' else 'CNY','unit':'原接口金额字段；港股单位待与报告核对','verification':'aggregated_unreconciled'}
             store.execute('INSERT OR REPLACE INTO financial_history VALUES(?,?,?,?)',(s['id'],period,json.dumps(payload,ensure_ascii=False),'AKShare／东方财富财务报表'))

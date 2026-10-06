@@ -38,3 +38,16 @@ def test_timeout_kills_worker_and_keeps_checkpoint(monkeypatch):
 def test_unreadable_pdf_fails_without_starting_app():
     with pytest.raises(ProviderError,match='PDF解析未完成'):
         extract(b'%PDF-invalid',timeout=20)
+
+
+def test_historical_financial_timeout_does_not_write_data(monkeypatch,tmp_path):
+    from backend.data_adapters import collect_financial_history
+    from backend.storage import Store
+    store=Store(tmp_path)
+    def timeout(*args,**kwargs):
+        assert kwargs['timeout']==45
+        raise subprocess.TimeoutExpired('history',45)
+    monkeypatch.setattr(subprocess,'run',timeout)
+    with pytest.raises(ProviderError,match='继续以官方原文研究'):
+        collect_financial_history(store,{'id':'HK:00700','ticker':'00700','exchange':'HK'})
+    assert not store.rows('SELECT * FROM financial_history')
