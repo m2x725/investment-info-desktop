@@ -11,6 +11,7 @@ from .domain import dec, money, portfolio, valuation
 from .providers import ProviderError, MODEL_MAX_OUTPUT_TOKENS
 from .collection import Collector
 from .signals import disclosure_signal
+from .cancellation import JobCancelled
 
 
 def beijing_now():
@@ -219,6 +220,9 @@ class Services:
         self.collector=Collector(market)
         self.collection_locks={}
         self.job_context=threading.local()
+        self.job_controls = {}
+        self.controls_lock = threading.Lock()
+        self.profile_lock = threading.Lock()
         self.stop = threading.Event()
         self.scheduler = None
 
@@ -234,6 +238,9 @@ class Services:
                 "remaining": money(max(Decimal(0), limit-used)), "warning": used >= limit * Decimal("0.8")}
 
     def ai_call(self, messages):
+        self.check_cancelled()
+        self.sync_model_profile()
+        self.check_cancelled()
         settings = self.store.settings()
         if not settings["prices_confirmed"]:
             raise ProviderError("模型单价尚未确认。请在维护设置中核对官方单价后开启调用。",unbilled=True)
@@ -242,9 +249,10 @@ class Services:
         text = json.dumps(messages, ensure_ascii=False)
         # UTF-8 byte count plus chat overhead conservatively bounds input tokens for this text workflow.
         bound = len(text.encode("utf-8")) + 2048
-        if bound > 120000:
+        output_limit = min(MODEL_MAX_OUTPUT_TOKENS, max(1,(settings.get('context_length') or 262144)-bound))
+        if bound > 120000 or (settings.get('context_length') and bound>=settings['context_length']):
             raise ProviderError("研究资料过长，请减少原文章节后重试。",unbilled=True)
-        reserve = (dec(settings["input_price"]) * bound + dec(settings["output_price"]) * MODEL_MAX_OUTPUT_TOKENS) / Decimal(1000000)
+        reserve = (dec(settings["input_price"]) * bound + dec(settings["output_price"]) * output_limit) / Decimal(1000000)
         month = beijing_now().strftime("%Y-%m")
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -255,17 +263,27 @@ class Services:
             eid = db.execute("INSERT INTO expenses(month,status,amount,reserved,created_at) VALUES(?,?,?,?,?)",
                              (month, "reserved", "0", str(reserve), utcnow())).lastrowid
         try:
-            payload, usage = self.kimi.complete(settings["model"], messages)
+            from .providers import Kimi
+            control = getattr(self.job_context, 'control', None)
+            payload, usage = (self.kimi.complete(settings["model"], messages, max_tokens=output_limit, control=control)
+                              if isinstance(self.kimi, Kimi) else self.kimi.complete(settings["model"], messages))
             from .model_profile import usage_cost
             amount = usage_cost(settings, usage)
             self.store.execute("UPDATE expenses SET status='charged',amount=? WHERE id=?", (str(amount), eid))
+            self.check_cancelled()
             return payload
+        except JobCancelled:
+            # Direct control signals here occur before transport or after a charged response.
+            self.store.execute("UPDATE expenses SET status='charged',amount='0' WHERE id=? AND status='reserved'",(eid,))
+            raise
         except Exception:
             # Timeout/invalid response may still be billed: retain the reservation, do not retry blindly.
             self.store.event("ai", "模型调用未完成；本次预留费用保留，需核对服务商账单。")
+            self.check_cancelled()
             raise
 
     def reserve_expense(self,amount):
+        self.check_cancelled()
         settings=self.store.settings();month=beijing_now().strftime('%Y-%m')
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -348,26 +366,118 @@ class Services:
             except Exception:self.store.event('import','指定文件夹中的一个文件未能识别，请在维护区检查。')
 
     def submit(self, kind, func):
+        from .cancellation import JobControl, JobCancelled
         jid = uuid.uuid4().hex
+        control = JobControl()
+        with self.controls_lock:self.job_controls[jid] = control
         self.store.execute("INSERT INTO jobs(id,kind,status,message,result_id,created_at) VALUES(?,?,?,?,?,?)",
                            (jid, kind, "queued", "正在准备", None, utcnow()))
 
         def run():
-            self.store.execute("UPDATE jobs SET status='running',message='正在处理，请稍候' WHERE id=?", (jid,))
             try:
                 self.job_context.id = jid
                 self.job_context.scope = (0, 100)
+                self.job_context.control = control
+                self.store.write_context.control = control
+                with control.lock:
+                    control.check()
+                    self.store.execute("UPDATE jobs SET status='running',message='正在处理，请稍候' WHERE id=?", (jid,))
                 result = func()
-                self.store.execute("UPDATE jobs SET status='done',message='已完成',progress=100,result_id=? WHERE id=?",
+                with control.lock:
+                    control.check()
+                    self.store.execute("UPDATE jobs SET status='done',message='已完成',progress=100,result_id=? WHERE id=?",
                                    (result if isinstance(result, int) else None, jid))
+            except JobCancelled:
+                with control.lock:
+                    with self.store.connect() as db:
+                        control.discard(db)
+                        db.execute("UPDATE jobs SET status='cancelled',message='已取消，本次报告与草稿未保存',result_id=NULL WHERE id=?",(jid,))
             except Exception as exc:
                 message = str(exc) if isinstance(exc, ProviderError) else "任务未完成，请到维护设置查看状态后重试。"
-                self.store.execute("UPDATE jobs SET status='failed',message=? WHERE id=?", (message, jid))
-                self.store.event(kind, message)
+                with control.lock:
+                    if control.cancelled.is_set():
+                        with self.store.connect() as db:
+                            control.discard(db)
+                            db.execute("UPDATE jobs SET status='cancelled',message='已取消，本次报告与草稿未保存',result_id=NULL WHERE id=?",(jid,))
+                    else:
+                        self.store.execute("UPDATE jobs SET status='failed',message=? WHERE id=?", (message, jid))
+                        self.store.event(kind, message)
             finally:
                 self.job_context.id = None
-        self.executor.submit(run)
+                self.job_context.control = None
+                self.store.write_context.control = None
+                with self.controls_lock:self.job_controls.pop(jid, None)
+        control.future = self.executor.submit(run)
         return jid
+
+    def check_cancelled(self):
+        control = getattr(self.job_context, 'control', None)
+        if control:control.check()
+
+    def sync_model_profile(self, force=False):
+        from .providers import Kimi
+        from .model_profile import select_api_profile, PROFILE
+        if not isinstance(self.kimi, Kimi) or not self.credentials.get('kimi'):return
+        self.check_cancelled()
+        with self.profile_lock:
+            cfg=self.store.settings()
+            checked=cfg.get('model_sync',{}).get('checked_at')
+            if not force and checked:
+                try:
+                    age=(datetime.now(timezone.utc)-datetime.fromisoformat(checked)).total_seconds()
+                    if cfg.get('model_sync',{}).get('status')=='unavailable' and age<60:
+                        raise ProviderError('模型配置尚未自动核实，请稍后重试或重新保存连接。',unbilled=True)
+                    if cfg.get('model_sync',{}).get('status')!='unavailable' and age<86400:return
+                except ValueError:pass
+            try:
+                models=self.kimi.models()
+                self.check_cancelled()
+                warning=''
+                try:rates=self.kimi.official_rates()
+                except ProviderError:
+                    prior=cfg.get('provider_profile')
+                    rates={prior['model']:prior} if prior else {PROFILE['model']:PROFILE}
+                    warning='官方费率暂未更新，按上次核实费率估算。'
+                self.check_cancelled()
+                profile=select_api_profile(models,rates)
+                stamp=utcnow()
+                profile['pricing_version']=profile.get('pricing_version',stamp[:10]) if warning else stamp[:10]
+                self.store.save_settings({'pricing_mode':'provider','provider_profile':profile,
+                                          'model_sync':{'status':'cached_rates' if warning else 'ready','checked_at':stamp,'message':warning or '已自动读取可用模型与官方费率'}})
+            except (ProviderError,ValueError) as exc:
+                self.check_cancelled()
+                self.store.save_settings({'model_sync':{'status':'unavailable','checked_at':utcnow(),'message':str(exc)}})
+                raise ProviderError('模型配置未能自动核实，未发起付费分析。请检查密钥权限和网络。',unbilled=True) from exc
+            return self.store.settings().get('model_sync')
+
+    def track_run(self, run):
+        control = getattr(self.job_context, 'control', None)
+        if control:
+            with control.lock:
+                control.check()
+                control.runs.add(run)
+
+    def cancel_job(self, jid):
+        with self.controls_lock:control = self.job_controls.get(jid)
+        if not control:return {'accepted':False}
+        with control.lock:
+            row = self.store.rows('SELECT status FROM jobs WHERE id=?',(jid,))[0]
+            if row['status'] not in ('queued','running','cancelling'):return {'accepted':False}
+            control.cancelled.set()
+            queued = bool(control.future and control.future.cancel())
+            with self.store.connect() as db:
+                control.discard(db)
+                db.execute("UPDATE jobs SET status=?,message=?,result_id=NULL WHERE id=?",
+                           ('cancelled' if queued else 'cancelling', '已取消，本次报告与草稿未保存' if queued else '正在取消：已停止后续步骤，本次报告与草稿不保存',jid))
+            closers = list(control.closers)
+        def close_requests():
+            for closer in closers:
+                try:closer()
+                except Exception:pass
+        threading.Thread(target=close_requests,daemon=True).start()
+        if queued:
+            with self.controls_lock:self.job_controls.pop(jid,None)
+        return {'accepted':True}
 
     def research(self, sid, question, run_id=None):
         if not self.research_lock.acquire(blocking=False):
@@ -550,10 +660,11 @@ class Services:
         self.job_progress(message, percent)
 
     def job_progress(self, message, percent=None):
+        self.check_cancelled()
         jid = getattr(self.job_context, 'id', None)
         if jid:
             if percent is None:
-                self.store.execute("UPDATE jobs SET message=? WHERE id=?", (message,jid))
+                self.store.execute("UPDATE jobs SET message=? WHERE id=? AND status='running'", (message,jid))
             else:
                 start,end=getattr(self.job_context,'scope',(0,100))
                 value=min(99,max(0,round(start+(end-start)*percent/100)))

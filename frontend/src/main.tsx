@@ -30,7 +30,7 @@ function App(){
   const [editing,setEditing]=useState<any>(null),[showHolding,setShowHolding]=useState(false);
   const [evidence,setEvidence]=useState<any[]>([]),[showEvidence,setShowEvidence]=useState(false);
   const [credentialForm,setCredentialForm]=useState({kimi_key:'',push_key:''});
-  const [task,setTask]=useState<{id:string;label:string;completion?:string;detail?:string;progress?:number}|null>(null);
+  const [task,setTask]=useState<{id:string;label:string;completion?:string;detail?:string;progress?:number;cancelling?:boolean}|null>(null);
   const [removeId,setRemoveId]=useState('');
   const [feedbackHeight,setFeedbackHeight]=useState(0);
   const [completedResult,setCompletedResult]=useState<any>(null);
@@ -72,6 +72,8 @@ function App(){
         const j=await api('/jobs/'+task.id);
         if(!active)return;
         if((j.status==='running'||j.status==='queued')&&j.message)setTask(current=>current?.id===task.id?{...current,detail:j.message,progress:j.progress}:current);
+        if(j.status==='cancelling')setTask(current=>current?.id===task.id?{...current,cancelling:true,detail:j.message}:current);
+        if(j.status==='cancelled'){clearInterval(timer);await load();if(active){setTask(null);setCompletedResult(null);setNotice('已取消，本次报告与草稿未保存。');}return;}
         if(j.status==='done'||j.status==='failed'){
           clearInterval(timer);await load();
           if(j.status==='failed')setError(j.message);
@@ -99,6 +101,12 @@ function App(){
   async function job(path:string,label:string,body:any={}){
     if(task)throw new Error('已有任务在处理，请等待完成。');
     const r=await api(path,'POST',body);setTask({id:r.job_id,label,completion:/research|followup|news\/analyze/.test(path)?'分析已完成，结果已保存。':path==='/brief'?'简报已整理完成并保存。':'更新已完成。'});
+  }
+  async function cancelAnalysis(){
+    if(!task||task.cancelling)return;
+    const id=task.id;setTask(current=>current?.id===id?{...current,cancelling:true,detail:'正在取消分析…'}:current);
+    try{const result=await api('/jobs/'+id+'/cancel','POST',{});if(!result.accepted)setTask(current=>current?.id===id?{...current,cancelling:false}:current);}
+    catch(e:any){setError(e.message);setTask(current=>current?.id===id?{...current,cancelling:false}:current);}
   }
   function viewCompletedResult(){
     if(!completedResult)return;
@@ -144,7 +152,7 @@ function App(){
       <button className={page==='settings'?'nav active settings-nav':'nav settings-nav'} onClick={()=>navigate('settings')}><Settings2 size={19}/>维护设置</button>
     </aside>
     <main>
-      <FeedbackDock error={error} notice={notice} progress={task?(task.detail||task.label):pending?pending+'…':''} percent={task?.progress??(task?0:undefined)} onErrorClose={()=>setError('')} onNoticeClose={()=>{setNotice('');setCompletedResult(null)}} onViewResult={completedResult?viewCompletedResult:undefined} onHeight={setFeedbackHeight}/>
+      <FeedbackDock error={error} notice={notice} progress={task?(task.detail||task.label):pending?pending+'…':''} percent={task?.progress??(task?0:undefined)} onCancel={task?cancelAnalysis:undefined} cancelling={!!task?.cancelling} onErrorClose={()=>setError('')} onNoticeClose={()=>{setNotice('');setCompletedResult(null)}} onViewResult={completedResult?viewCompletedResult:undefined} onHeight={setFeedbackHeight}/>
       {feedbackHeight>0&&<div className="feedback-spacer" aria-hidden="true" style={{height:feedbackHeight}}/>}
       <header className="topline"><span>{new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'long',day:'numeric',weekday:'long'}).format(new Date())}</span><span className="local-state"><span/>本机运行</span></header>
       {page==='home'&&<>
@@ -227,16 +235,16 @@ function App(){
         <div className="page-heading"><h1>维护设置</h1></div>
         <section className="form-section"><h2>连接服务</h2><div className="connection-list"><p><span className={data.connections.kimi?'status on':'status'}>{data.connections.kimi?'已填写':'待配置'}</span>Kimi 开放平台</p><p><span className={data.connections.push?'status on':'status'}>{data.connections.push?'已填写':'待配置'}</span>Server酱微信推送</p></div><p className="help">密钥状态不代表调用成功。</p>
           {!data.connections.secure_persistence&&<p className="reading-note">此 Mac 上密钥仅保留到程序退出。Windows 版使用凭据管理器。</p>}
-          <form onSubmit={e=>{e.preventDefault();action('保存连接',async()=>{await api('/credentials','PUT',credentialForm);setCredentialForm({kimi_key:'',push_key:''});await load();setNotice('密钥已配置，未显示或写入数据库。');})}}><label>Kimi API 密钥<input type="password" autoComplete="off" value={credentialForm.kimi_key} onChange={e=>setCredentialForm({...credentialForm,kimi_key:e.target.value})} placeholder="留空则保留现有密钥"/></label><label>Server酱 SendKey<input type="password" autoComplete="off" value={credentialForm.push_key} onChange={e=>setCredentialForm({...credentialForm,push_key:e.target.value})} placeholder="以 SCT 开头；留空则保留"/></label>
+          <form onSubmit={e=>{e.preventDefault();action('保存连接',async()=>{const saved=await api('/credentials','PUT',credentialForm);if(saved.settings)setConfig(saved.settings);setCredentialForm({kimi_key:'',push_key:''});await load();setNotice(saved.model_sync?.status==='unavailable'?'密钥已保存，模型配置暂未核实，请检查网络或密钥权限。':'连接已保存，模型参数自动配置。');})}}><label>Kimi API 密钥<input type="password" autoComplete="off" value={credentialForm.kimi_key} onChange={e=>setCredentialForm({...credentialForm,kimi_key:e.target.value})} placeholder="留空则保留现有密钥"/></label><label>Server酱 SendKey<input type="password" autoComplete="off" value={credentialForm.push_key} onChange={e=>setCredentialForm({...credentialForm,push_key:e.target.value})} placeholder="以 SCT 开头；留空则保留"/></label>
             <div className="button-row"><button className="primary" disabled={disabled}>保存连接</button><button className="secondary" type="button" disabled={disabled} onClick={()=>action('发送测试',async()=>{await api('/push-test','POST',{});await load();setNotice('服务已接受测试消息；请在微信确认收到。');})}>发送微信测试</button><button className="secondary" type="button" disabled={disabled} onClick={()=>action('测试重点提醒',async()=>{await api('/push-alert-test','POST',{});await load();setNotice('重点提醒测试已提交，请在微信确认收到。');})}>测试重点提醒</button></div>
           </form><div className="button-row small-actions"><button className="text-button" disabled={disabled} onClick={()=>action('清除密钥',async()=>{await api('/credentials','PUT',{clear_kimi:true});await load();setNotice('Kimi 密钥已清除；环境变量配置需另行移除。');})}>清除 Kimi 密钥</button><button className="text-button" disabled={disabled} onClick={()=>action('清除密钥',async()=>{await api('/credentials','PUT',{clear_push:true});await load();setNotice('推送密钥已清除；环境变量配置需另行移除。');})}>清除推送密钥</button></div>
         </section>
         <details className="maintenance-group"><summary>导入持仓与交易流水</summary><AccountTools job={job} api={api} action={action} load={load} disabled={disabled} settings={config||data.settings}/></details>
         {config&&<section className="form-section"><h2>更新、提醒与费用</h2><form onSubmit={e=>{e.preventDefault();action('保存设置',async()=>{const times=Array.from(new Set((config.daily_times||[config.daily_time]).map(normalizeBriefTime))).sort();const settings={...config,daily_times:times,daily_time:times[0]};const saved=await api('/settings','PUT',settings);setConfig(saved.settings||settings);await load();setNotice('设置已保存。电脑开机联网时后台按规则工作。');})}}>
-          <p className="help">模型与计费参数已内置，粘贴 Kimi API 密钥即可使用。</p><div className="form-grid">
+          <p className="help">模型与费率自动获取，粘贴 Kimi API 密钥即可使用。</p><div className="form-grid">
             {[['monthly_limit','每月上限（元，最多200）'],['other_service_cost','其他服务月费（推送、数据等，元）'],['concentration','单股关注阈值（%）'],['move_threshold','价格变化阈值（%）']].map(([key,label])=><label key={key}>{label}<input type="number" step={key==='weekly_research_limit'?'1':'0.01'} min="0" required value={config[key]??'0'} onChange={e=>setConfig({...config,[key]:e.target.value})}/></label>)}
           </div><BriefTimesInput values={config.daily_times||[config.daily_time]} onChange={daily_times=>setConfig({...config,daily_times})}/><label>报价来源<select value={config.quote_provider||'public'} onChange={e=>setConfig({...config,quote_provider:e.target.value})}><option value="public">公开行情（可能延迟，按报价时间判断）</option><option value="futu">富途本地OpenD（需账号行情权限）</option></select></label>{[['online_research','研究时自动联网检索与补充资料'],['scheduler_enabled','启用定时收集（每30分钟）与每日简报'],['scheduler_paused','暂停开始新的定时任务（当前任务可完成）'],['push_enabled','启用微信推送（需绑定接收者）'],['auto_research','日报中启用 AI 原文分析（会产生费用）'],['event_research','新增重大资料时更新研究论点（会产生费用）']].map(([key,label])=><label className="check-label" key={key}><input type="checkbox" checked={!!config[key]} onChange={e=>setConfig({...config,[key]:e.target.checked})}/><span>{label}</span></label>)}
-          <details className="model-settings"><summary>高级模型设置</summary><label className="check-label"><input type="checkbox" checked={config.pricing_mode!=='manual'} onChange={e=>setConfig({...config,pricing_mode:e.target.checked?'builtin':'manual'})}/><span>使用内置 Kimi 配置</span></label>{config.pricing_mode==='manual'?<><div className="form-grid"><label>模型标识<input required value={config.model} onChange={e=>setConfig({...config,model:e.target.value})}/></label>{[['input_price','输入单价（元 / 百万 Token）'],['output_price','输出单价（元 / 百万 Token）']].map(([key,label])=><label key={key}>{label}<input type="number" step="0.01" min="0.01" required value={config[key]} onChange={e=>setConfig({...config,[key]:e.target.value})}/></label>)}</div><label className="check-label"><input type="checkbox" checked={!!config.prices_confirmed} onChange={e=>setConfig({...config,prices_confirmed:e.target.checked})}/><span>已核对自定义模型费率</span></label></>:<p className="help">Kimi K2.6 · 内置费率版本 {config.pricing_version}。费率随软件版本更新。</p>}</details>
+          <details className="model-settings"><summary>模型连接状态</summary><p className="help">当前模型：{config.model} · {config.model_sync?.status==='ready'?'已自动同步':config.model_sync?.status==='cached_rates'?'使用上次核实费率':'待自动核实'}</p>{config.model_sync?.message&&<p className="help">{config.model_sync.message}</p>}{config.model_sync?.checked_at&&<p className="help">最近检查：{stamp(config.model_sync.checked_at)}</p>}</details>
           <p className="help">费用按返回用量估算，以平台账单为准；超时保留预留费用。</p><button className="primary" disabled={disabled}>保存设置</button>
         </form><div className="budget-line"><span>{data.budget.month} 本机费用估算（含服务月费）：<strong>¥{fmt(data.budget.used)}</strong> / ¥{fmt(data.budget.limit)}</span>{data.budget.warning&&<strong className="loss">已达到预算的 80%</strong>}</div></section>}
         <details className="maintenance-group"><summary>备份与运行记录</summary><section className="form-section"><div className="section-title"><h2>维护与备份</h2><a className="secondary" href="/api/backup" download><Download size={18}/>下载数据库备份</a></div><p className="help">备份含个人资产与资料，不含密钥，请妥善保存。恢复需先停止程序，按 README 操作。</p>

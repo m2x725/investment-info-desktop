@@ -301,18 +301,32 @@ def create_app(data_dir=None, scheduler=True):
     def brief(body: dict):
         return {"job_id": services.submit("brief", lambda: services.brief(send=bool(body.get("send", False)),analyze=body.get("analyze")))}
 
+    @app.post('/api/jobs/{jid}/cancel')
+    def cancel_job(jid: str):
+        if not store.rows('SELECT id FROM jobs WHERE id=?',(jid,)):
+            raise HTTPException(404, '任务不存在')
+        return services.cancel_job(jid)
+
     @app.put("/api/settings")
     def settings(body: Settings):
-        store.save_settings(body.model_dump(mode="json"))
+        values=body.model_dump(mode="json")
+        if store.settings().get('provider_profile'):
+            for key in ('model','input_price','output_price','cached_input_price','pricing_version','pricing_source','prices_confirmed'):
+                values.pop(key,None)
+            values['pricing_mode']='provider'
+        store.save_settings(values)
         return {"ok": True, "settings": store.settings()}
 
     @app.put("/api/credentials")
     def save_credentials(body: Secrets):
         if body.kimi_key or body.clear_kimi:
             credentials.set("kimi", "" if body.clear_kimi else body.kimi_key.strip())
+            store.save_settings({'model_sync':{}})
         if body.push_key or body.clear_push:
             credentials.set("push", "" if body.clear_push else body.push_key.strip())
-        return {"ok": True, "persisted": credentials.persisted}
+        try:sync=services.sync_model_profile(force=True) if body.kimi_key else None
+        except ProviderError:sync=store.settings().get('model_sync')
+        return {"ok": True, "persisted": credentials.persisted, "model_sync":sync, "settings":store.settings()}
 
     @app.post("/api/push-test")
     def test_push():

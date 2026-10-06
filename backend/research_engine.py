@@ -4,6 +4,7 @@ from datetime import datetime,timedelta,timezone
 from urllib.parse import urlparse
 from .domain import dec,money,valuation
 from .providers import ProviderError
+from .cancellation import JobCancelled
 from .storage import utcnow
 from .accounting import overview,risk_analysis
 
@@ -82,6 +83,7 @@ class ResearchEngine:
         self.svc=services;self.store=services.store;self.searches=0;self.fetches=0
 
     def tool(self,name,payload):
+        self.svc.check_cancelled()
         cache_key=hashlib.sha256(json.dumps([name,payload],sort_keys=True).encode()).hexdigest()
         cached=self.store.rows('SELECT * FROM tool_cache WHERE cache_key=?',(cache_key,))
         if cached and datetime.now(timezone.utc)-datetime.fromisoformat(cached[0]['created_at'])<timedelta(hours=6):return json.loads(cached[0]['payload'])
@@ -90,13 +92,20 @@ class ResearchEngine:
         fee=dec('.015' if name=='search_pro' else '.01')
         eid=self.svc.reserve_expense(fee)
         try:
-            result=self.svc.kimi.tool(name,payload)
+            from .providers import Kimi
+            control = getattr(self.svc.job_context, 'control', None)
+            result=(self.svc.kimi.tool(name,payload,control=control) if isinstance(self.svc.kimi,Kimi) else self.svc.kimi.tool(name,payload))
             billed=bool(result.get('search_results')) if name=='search_pro' else bool(result.get('markdown','').strip())
             self.store.execute("UPDATE expenses SET status='charged',amount=? WHERE id=?",(str(fee if billed else 0),eid))
+            self.svc.check_cancelled()
             self.store.execute('INSERT OR REPLACE INTO tool_cache VALUES(?,?,?)',(cache_key,json.dumps(result,ensure_ascii=False),utcnow()))
             return result
+        except JobCancelled:
+            self.store.execute("UPDATE expenses SET status='charged',amount='0' WHERE id=? AND status='reserved'",(eid,))
+            raise
         except Exception:
             self.store.event('tools','联网工具调用结果不明；保留费用预留，不自动重试。')
+            self.svc.check_cancelled()
             raise
 
     def retrieve(self,s,run,latest_only=False):
@@ -158,12 +167,15 @@ class ResearchEngine:
         return warnings
 
     def company(self,sid,question,run_id=None):
+        self.svc.check_cancelled()
+        self.svc.sync_model_profile()
         security=self.store.rows('SELECT * FROM securities WHERE id=?',(sid,))[0]
         if run_id:
             runs=self.store.rows('SELECT * FROM research_runs WHERE id=? AND security_id=?',(run_id,sid))
             if not runs:raise ProviderError('研究断点不存在或公司不一致。')
             run=run_id
             if runs[0]['status']=='done':return runs[0]['report_id']
+            self.svc.track_run(run)
         else:
             run=uuid.uuid4().hex
             self.store.execute('INSERT INTO research_runs VALUES(?,?,?,?,?,?,?)',(run,sid,'company',json.dumps({'as_of':utcnow(),'question':question},ensure_ascii=False),'running',utcnow(),None))
@@ -240,6 +252,8 @@ class ResearchEngine:
         return rid
 
     def portfolio(self):
+        self.svc.check_cancelled()
+        self.svc.sync_model_profile()
         from .services import SYSTEM
         self.svc.job_progress("正在核算持仓与组合风险",5)
         snapshot=overview(self.store);risk=risk_analysis(self.store,snapshot);run=uuid.uuid4().hex

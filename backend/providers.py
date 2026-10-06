@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from urllib.parse import urlparse
 import httpx
+from contextlib import contextmanager
 from .domain import dec
 
 
@@ -204,12 +205,53 @@ class Kimi:
         self.credentials = credentials
         self.client = httpx.Client(timeout=httpx.Timeout(120, connect=10), follow_redirects=False)
 
-    def complete(self, model, messages, max_tokens=MODEL_MAX_OUTPUT_TOKENS):
+    @contextmanager
+    def request_client(self, control=None):
+        if control is None:
+            yield self.client
+            return
+        client = httpx.Client(timeout=httpx.Timeout(120, connect=10), follow_redirects=False)
+        try:
+            control.register(client.close)
+            control.check()
+            yield client
+        finally:
+            control.unregister(client.close)
+            client.close()
+
+    def post(self, url, control=None, **kwargs):
+        with self.request_client(control) as client:
+            if control:control.check()
+            return client.post(url, **kwargs)
+
+    def models(self):
+        key = self.credentials.get('kimi')
+        if not key:raise ProviderError('请先配置 Kimi API 密钥。',unbilled=True)
+        try:
+            r=self.client.get('https://api.moonshot.cn/v1/models',headers={'Authorization':'Bearer '+key},timeout=12)
+            r.raise_for_status()
+            data=r.json()['data']
+            if not isinstance(data,list):raise ValueError('invalid models')
+            return data
+        except Exception as exc:
+            raise ProviderError('模型列表未更新，请检查密钥权限和网络；已有配置保留。',unbilled=True) from exc
+
+    def official_rates(self):
+        from .model_profile import parse_official_rates
+        try:
+            r=self.client.get('https://platform.kimi.com/docs/pricing/chat.md',timeout=12)
+            r.raise_for_status()
+            if len(r.content)>1000000:raise ValueError('rate document too large')
+            return parse_official_rates(r.text)
+        except Exception as exc:
+            raise ProviderError('官方费率未更新，保留上次已核实费率。',unbilled=True) from exc
+
+    def complete(self, model, messages, max_tokens=MODEL_MAX_OUTPUT_TOKENS, control=None):
         key = self.credentials.get("kimi")
         if not key:
             raise ProviderError("尚未配置 Kimi 开放平台密钥。请在维护设置中配置。")
         try:
-            r = self.client.post("https://api.moonshot.cn/v1/chat/completions",
+            r = self.post("https://api.moonshot.cn/v1/chat/completions",control=control,
                                  headers={"Authorization": f"Bearer {key}"},
                                  json={"model": model, "messages": messages, "max_tokens": max_tokens,
                                        "thinking": {"type": "disabled"},
@@ -236,12 +278,12 @@ class Kimi:
             # Never propagate provider bodies: they may contain credentials or private input.
             raise ProviderError("Kimi 请求或报告格式失败，请检查账号权限、余额和网络。本次费用保守记录。") from exc
 
-    def tool(self,name,payload):
+    def tool(self,name,payload,control=None):
         if name not in ('search_pro','fetch'):raise ProviderError('不支持此联网工具。')
         key=self.credentials.get('kimi')
         if not key:raise ProviderError('Kimi尚未配置。')
         try:
-            r=self.client.post('https://api.moonshot.cn/v1/tools/'+name,headers={'Authorization':'Bearer '+key},json=payload)
+            r=self.post('https://api.moonshot.cn/v1/tools/'+name,control=control,headers={'Authorization':'Bearer '+key},json=payload)
             r.raise_for_status()
             result=r.json()
             if not isinstance(result,dict):raise ValueError('invalid')

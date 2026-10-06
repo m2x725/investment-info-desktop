@@ -4,7 +4,7 @@ import secrets
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from contextlib import contextmanager
 
-APP_VERSION = '0.1.4'
+APP_VERSION = '0.1.5'
 
 
 def fresh_window_url(url):

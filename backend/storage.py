@@ -3,6 +3,8 @@ import json
 import os
 import sqlite3
 import sys
+import threading
+import re
 from contextlib import contextmanager, closing
 from pathlib import Path
 from datetime import datetime, timezone
@@ -32,6 +34,7 @@ DEFAULTS = {
 
 class Store:
     def __init__(self, directory=None):
+        self.write_context = threading.local()
         self.directory = Path(directory) if directory else default_data_dir()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.path = self.directory / "portfolio.db"
@@ -94,6 +97,7 @@ class Store:
                 db.execute("INSERT OR IGNORE INTO settings VALUES(?,?)", (key, json.dumps(val)))
             # A stopped process cannot finish its previous jobs. Keep reserved spend conservatively.
             db.execute("UPDATE jobs SET status='failed',message='上次运行中断，请重新开始。' WHERE status IN ('queued','running')")
+            db.execute("UPDATE jobs SET status='cancelled',message='已取消，本次报告与草稿未保存',result_id=NULL WHERE status='cancelling'")
             db.execute("UPDATE notifications SET status='unknown',message='上次运行中断，收件结果不明；请在微信核对。' WHERE status='sending'")
 
         with self.connect() as db:
@@ -124,6 +128,14 @@ class Store:
             return [dict(row) for row in db.execute(sql, args).fetchall()]
 
     def execute(self, sql, args=()):
+        control = getattr(self.write_context, 'control', None)
+        if control and re.search(r'\b(?:INTO|UPDATE|FROM)\s+(?:reports|research_outputs|research_runs|research_sections)\b', sql, re.I):
+            with control.lock:
+                control.check()
+                with self.connect() as db:
+                    rowid = db.execute(sql, args).lastrowid
+                control.record(sql, args, rowid)
+                return rowid
         with self.connect() as db:
             return db.execute(sql, args).lastrowid
 

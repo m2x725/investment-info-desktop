@@ -92,7 +92,7 @@ class Evidence(BaseModel):
 
 class Settings(BaseModel):
     model_config = {"validate_default": True}
-    pricing_mode: Literal["auto", "builtin", "manual"] = "auto"
+    pricing_mode: Literal["auto", "builtin", "manual", "provider"] = "auto"
     cached_input_price: Decimal | None = Field(default=None, ge=0, le=1000)
     pricing_version: str = ""
     pricing_source: str = ""

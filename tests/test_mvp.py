@@ -17,6 +17,9 @@ def api(tmp_path):
     app = create_app(tmp_path, scheduler=False)
     app.state.services.collect_company=Mock(return_value={"failures":[]})
     app.state.services.collect_financial_history=Mock(return_value=None)
+    from backend.model_profile import PROFILE
+    app.state.services.kimi.models=Mock(return_value=[{'id':'kimi-k2.6','context_length':262144}])
+    app.state.services.kimi.official_rates=Mock(return_value={'kimi-k2.6':dict(PROFILE)})
     with TestClient(app) as client:
         client.headers["X-App-Token"] = client.get("/api/bootstrap").json()["csrf"]
         yield client, app
