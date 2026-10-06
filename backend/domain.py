@@ -92,6 +92,10 @@ class Evidence(BaseModel):
 
 class Settings(BaseModel):
     model_config = {"validate_default": True}
+    pricing_mode: Literal["auto", "builtin", "manual"] = "auto"
+    cached_input_price: Decimal | None = Field(default=None, ge=0, le=1000)
+    pricing_version: str = ""
+    pricing_source: str = ""
     model: str = Field(default="kimi-k2.6", pattern=r"^kimi-[a-zA-Z0-9.-]+$")
     monthly_limit: Decimal = Field(default=200, gt=0, le=200)
     other_service_cost: Decimal = Field(default=0, ge=0, le=200, decimal_places=2)
@@ -111,6 +115,13 @@ class Settings(BaseModel):
     online_research: bool = True
     quote_provider: Literal["public","futu"] = "public"
     weekly_research_limit: int = Field(default=2, ge=1, le=10)
+
+    @model_validator(mode="before")
+    @classmethod
+    def built_in_model(cls, values):
+        from .model_profile import resolve_profile
+        if isinstance(values, dict):return resolve_profile(values)
+        return values
 
     @field_validator('daily_times')
     @classmethod

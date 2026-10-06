@@ -169,11 +169,13 @@ class ResearchEngine:
             self.store.execute('INSERT INTO research_runs VALUES(?,?,?,?,?,?,?)',(run,sid,'company',json.dumps({'as_of':utcnow(),'question':question},ensure_ascii=False),'running',utcnow(),None))
         from .services import SYSTEM
         warnings=[]
-        try:self.svc.collect_company(sid)
+        try:
+            with self.svc.progress_scope(0,35):self.svc.collect_company(sid)
         except Exception:warnings.append('官方资料更新失败，继续使用可读缓存和联网检索。')
+        self.svc.job_progress("正在补充历史财务数据",35)
         try:self.svc.collect_financial_history(sid)
         except Exception:warnings.append('结构化历史财务表未更新；保留官方报告和明确缺口。')
-        self.svc.job_progress("正在联网搜索并补充研究资料")
+        self.svc.job_progress("正在联网搜索并补充研究资料",40)
         try:warnings+=self.retrieve(security,run)
         except Exception:warnings.append('联网检索未完成，已保留研究断点。')
         evidence=self.store.rows("SELECT * FROM evidence WHERE security_id=? AND verification!='title_only' ORDER BY published_at DESC",(sid,))
@@ -193,7 +195,8 @@ class ResearchEngine:
         if 'calculation' not in run_snapshot:
             run_snapshot['calculation']=calculation
             self.store.execute('UPDATE research_runs SET snapshot=? WHERE id=?',(json.dumps(run_snapshot,ensure_ascii=False),run))
-        for key,label in SECTIONS:
+        for index,(key,label) in enumerate(SECTIONS):
+            self.svc.job_progress(f"AI正在分析：{label}（{index+1}/{len(SECTIONS)}）",50+40*index/len(SECTIONS))
             previous=self.store.rows('SELECT * FROM research_sections WHERE run_id=? AND section=?',(run,key))
             if previous and previous[0]['status']=='done':sections.append({'key':key,'label':label,'status':'done','report':json.loads(previous[0]['payload'])});continue
             if previous and previous[0]['status']=='uncertain':
@@ -202,7 +205,6 @@ class ResearchEngine:
             continuation=json.loads(previous[0]['payload']) if previous and previous[0]['status']=='partial' else None
             self.store.execute('INSERT OR REPLACE INTO research_sections VALUES(?,?,?,?)',(run,key,'{}','uncertain'))
             try:
-                self.svc.job_progress("AI正在分析："+label)
                 payload=self.svc.ai_call([{'role':'system','content':SYSTEM+'\n采用研究模板 '+TEMPLATE_VERSION+'。只完成当前章节，完整分析证据、推论、假设及缺口，不写交易指令。'}, {'role':'user','content':json.dumps({'company':security,'as_of':run_snapshot['as_of'],'question':question,'chapter':label,'materials':materials,'calculation':calculation,'completed_chapters':[{ 'chapter':s['label'],'summary':context_text(s['report']['summary'])} for s in sections] if key=='countercase' else [],'continuation':{'summary':context_text(continuation['summary'],20000),'saved_characters':len(continuation['summary'])} if continuation else None,'instruction':'若continuation有内容，仅续写缺失部分，避免重复已保存内容'},ensure_ascii=False)}])
                 checked=self.svc.validate_output(payload,good,calculation,sid,key)
                 if continuation:
@@ -226,6 +228,7 @@ class ResearchEngine:
         if not done:
             self.store.execute("UPDATE research_runs SET status='partial' WHERE id=?",(run,))
             raise ProviderError('研究章节尚未完成；断点已保存，调用结果不明时不会自动重复付费。')
+        self.svc.job_progress('正在核验并保存报告',95)
         summary='\n\n'.join(s['label']+'：'+s['report']['summary'] for s in done)
         report={'title':security['name']+' · 系统研究','summary':summary,'facts':[],'support':[],'risks':[],'unknowns':warnings,'assumptions':[],'sections':sections,'as_of':run_snapshot['as_of'],'run_id':run,'template_version':TEMPLATE_VERSION,'calculation':calculation,'model':self.store.settings()['model'],'coverage':{'readable_sources':len(good),'unreadable_sources':len(evidence)-len(good),'completed_sections':len([s for s in sections if s['status']=='done']),'total_sections':len(SECTIONS)}}
         for section in done:
@@ -238,12 +241,15 @@ class ResearchEngine:
 
     def portfolio(self):
         from .services import SYSTEM
+        self.svc.job_progress("正在核算持仓与组合风险",5)
         snapshot=overview(self.store);risk=risk_analysis(self.store,snapshot);run=uuid.uuid4().hex
         self.store.execute('INSERT INTO research_runs VALUES(?,?,?,?,?,?,?)',(run,None,'portfolio',json.dumps(snapshot,ensure_ascii=False),'running',utcnow(),None))
         # Monetary values, quantity, cost, and account identifiers never enter the model request.
         holdings=[{k:p.get(k) for k in ('id','name','industry','weight','currency')} for p in snapshot['positions']]
         evidence=[];reports=[];warnings=[]
-        for p in sorted(snapshot['positions'],key=lambda x:float(x.get('weight') or 0),reverse=True):
+        ordered=sorted(snapshot['positions'],key=lambda x:float(x.get('weight') or 0),reverse=True)
+        for index,p in enumerate(ordered):
+            self.svc.job_progress('正在更新持仓研究：'+p['name'],10+70*index/max(1,len(ordered)))
             security=self.store.rows('SELECT * FROM securities WHERE id=?',(p['id'],))[0]
             child=run+'-'+p['id']
             self.store.execute('INSERT INTO research_runs VALUES(?,?,?,?,?,?,?)',(child,p['id'],'retrieval',json.dumps({'as_of':snapshot['as_of']}),'running',utcnow(),None))
@@ -254,7 +260,8 @@ class ResearchEngine:
             rows=self.store.rows("SELECT payload,evidence_ids FROM reports WHERE security_id=? AND kind='research' ORDER BY id DESC LIMIT 1",(p['id'],))
             if not rows:
                 try:
-                    self.company(p['id'],'完整公司底稿：业务、历史财务、最新事件、竞争、估值与反方证据')
+                    with self.svc.progress_scope(10+70*index/len(ordered),10+70*(index+1)/len(ordered)):
+                        self.company(p['id'],'完整公司底稿：业务、历史财务、最新事件、竞争、估值与反方证据')
                     rows=self.store.rows("SELECT payload,evidence_ids FROM reports WHERE security_id=? AND kind='research' ORDER BY id DESC LIMIT 1",(p['id'],))
                 except Exception as exc:warnings.append(p['name']+'：个股底稿未完成，组合结论覆盖有限。')
             if rows:
@@ -266,11 +273,13 @@ class ResearchEngine:
         if not good:raise ProviderError('没有可读研究来源，已保留快照；请先更新资料。')
         risk['warnings']+=warnings
         clean_risk={k:risk[k] for k in ('industry_weights','currency_weights','observations','warnings')}
+        self.svc.job_progress('AI正在综合分析组合',85)
         try:payload=self.svc.ai_call([{'role':'system','content':SYSTEM+'\n分析组合共同业务因素、仓位集中、论点变化、优先复查和观察指标。缺少个股研究时明确说明，不能称为完整尽调。'}, {'role':'user','content':json.dumps({'as_of':snapshot['as_of'],'holdings':holdings,'research':reports,'risk':clean_risk,'materials':material_pack(self.store,good,'countercase')},ensure_ascii=False)}])
         except ProviderError as exc:
             if not exc.unbilled:raise
             payload={'title':'组合计算快照 · 综合研究未完成','summary':'本地核算与已生成的公司底稿已保留，综合模型调用未执行：'+str(exc),'facts':[],'support':[],'risks':[],'unknowns':[str(exc)],'assumptions':[]}
             risk['warnings'].append('本次综合模型研究未完成，不能作为完整组合分析。')
+        self.svc.job_progress('正在核验并保存组合报告',95)
         report=self.svc.validate_output(payload,good,None,None,'portfolio')
         report.update(as_of=snapshot['as_of'],snapshot=snapshot,risk=risk,run_id=run,template_version=TEMPLATE_VERSION,coverage={'holdings':len(holdings),'researched':len(reports)},model=self.store.settings()['model'])
         rid=self.store.execute('INSERT INTO reports(security_id,kind,payload,evidence_ids,created_at) VALUES(?,?,?,?,?)',(None,'portfolio',json.dumps(report,ensure_ascii=False),json.dumps(list({e['id'] for e in good})),utcnow()))

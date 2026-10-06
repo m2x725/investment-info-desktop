@@ -303,7 +303,7 @@ def create_app(data_dir=None, scheduler=True):
     @app.put("/api/settings")
     def settings(body: Settings):
         store.save_settings(body.model_dump(mode="json"))
-        return {"ok": True}
+        return {"ok": True, "settings": store.settings()}
 
     @app.put("/api/credentials")
     def save_credentials(body: Secrets):

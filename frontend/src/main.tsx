@@ -30,7 +30,7 @@ function App(){
   const [editing,setEditing]=useState<any>(null),[showHolding,setShowHolding]=useState(false);
   const [evidence,setEvidence]=useState<any[]>([]),[showEvidence,setShowEvidence]=useState(false);
   const [credentialForm,setCredentialForm]=useState({kimi_key:'',push_key:''});
-  const [task,setTask]=useState<{id:string;label:string;completion?:string;detail?:string}|null>(null);
+  const [task,setTask]=useState<{id:string;label:string;completion?:string;detail?:string;progress?:number}|null>(null);
   const [removeId,setRemoveId]=useState('');
   const [feedbackHeight,setFeedbackHeight]=useState(0);
   const [completedResult,setCompletedResult]=useState<any>(null);
@@ -71,20 +71,20 @@ function App(){
       try{
         const j=await api('/jobs/'+task.id);
         if(!active)return;
-        if(j.status==='running'&&j.message)setTask(current=>current?.id===task.id?{...current,detail:j.message}:current);
+        if((j.status==='running'||j.status==='queued')&&j.message)setTask(current=>current?.id===task.id?{...current,detail:j.message,progress:j.progress}:current);
         if(j.status==='done'||j.status==='failed'){
           clearInterval(timer);await load();
           if(j.status==='failed')setError(j.message);
           else {
             if(j.result_id){const r=await api('/reports/'+j.result_id);if(active)setCompletedResult(r);if(active&&r.kind==='news_analysis'){setPage('home');}else if(active){setReport(r);if(r.security_id)setSelected(r.security_id);if(r.kind!=='brief')setPage(r.kind==='portfolio'?'portfolio':'research');}}
-            if(active)setNotice(task.completion||'任务已完成并保存。');
+            if(active)setNotice((task.completion||'任务已完成并保存。')+' · 100%');
           }
           if(active)setTask(null);
         }
       }catch(e:any){if(active){setError(e.message);setTask(null);clearInterval(timer);}}
     },900);
     return()=>{active=false;clearInterval(timer)};
-  },[task]);
+  },[task?.id]);
   useEffect(()=>{
     let active=true;setEvidence([]);setValuation(null);
     if(selected){
@@ -144,7 +144,7 @@ function App(){
       <button className={page==='settings'?'nav active settings-nav':'nav settings-nav'} onClick={()=>navigate('settings')}><Settings2 size={19}/>维护设置</button>
     </aside>
     <main>
-      <FeedbackDock error={error} notice={notice} progress={task?(task.detail||task.label)+'，请稍候。可以继续阅读已有资料。':pending?pending+'…':''} onErrorClose={()=>setError('')} onNoticeClose={()=>{setNotice('');setCompletedResult(null)}} onViewResult={completedResult?viewCompletedResult:undefined} onHeight={setFeedbackHeight}/>
+      <FeedbackDock error={error} notice={notice} progress={task?(task.detail||task.label):pending?pending+'…':''} percent={task?.progress??(task?0:undefined)} onErrorClose={()=>setError('')} onNoticeClose={()=>{setNotice('');setCompletedResult(null)}} onViewResult={completedResult?viewCompletedResult:undefined} onHeight={setFeedbackHeight}/>
       {feedbackHeight>0&&<div className="feedback-spacer" aria-hidden="true" style={{height:feedbackHeight}}/>}
       <header className="topline"><span>{new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'long',day:'numeric',weekday:'long'}).format(new Date())}</span><span className="local-state"><span/>本机运行</span></header>
       {page==='home'&&<>
@@ -191,7 +191,7 @@ function App(){
         <div className="company-select"><label>当前关注公司<select value={selected} onChange={e=>{setSelected(e.target.value);setReport(null)}}><option value="">请选择公司</option>{data.followed.map(s=><option key={s.id} value={s.id}>{s.name} · {s.ticker}</option>)}</select></label><button className="text-button" onClick={()=>navigate('portfolio')}>手动添加公司<Plus size={17}/></button></div>
         {company?<><section className="research-start"><div><h2>{company.name}</h2><p>{company.exchange} · {company.ticker}　{evidence.filter(e=>e.verification!=='title_only').length} 份资料</p></div><button className="primary" disabled={disabled} onClick={()=>action('开始研究',()=>job('/research','研究公司',{security_id:selected,question:researchQuestion}))}>开始分析<ArrowRight size={18}/></button></section>
           <div className="research-topics"><p>研究主题</p><div className="button-row">{['主要靠什么赚钱','最近有什么变化','估值怎么看','继续持有要关注什么'].map(q=><button key={q} className={researchQuestion===q?'primary':'secondary'} aria-pressed={researchQuestion===q} onClick={()=>setResearchQuestion(q)}>{q}</button>)}</div><label>研究问题<input value={researchQuestion} onChange={e=>setResearchQuestion(e.target.value)} maxLength={300}/></label></div>
-          {(!data.connections.kimi||!data.settings.prices_confirmed)&&<p className="reading-note">请在维护设置填写 Kimi 密钥并确认单价。</p>}
+          {(!data.connections.kimi||!data.settings.prices_confirmed)&&<p className="reading-note">请在维护设置粘贴 Kimi API 密钥。</p>}
           {report&&report.kind!=='portfolio'&&report.kind!=='brief'&&<ReportReader report={report} amount={amount} disabled={disabled} onClose={()=>setReport(null)} onFollowup={(q:string)=>action('回答问题',()=>job('/reports/'+report.id+'/followup','回答问题',{question:q}))}/> }
           {!report&&<div className="report-empty"><h3>点击分析，报告会自动打开</h3></div>}
           <details className="research-data"><summary>资料与估值参考</summary>
@@ -232,12 +232,13 @@ function App(){
           </form><div className="button-row small-actions"><button className="text-button" disabled={disabled} onClick={()=>action('清除密钥',async()=>{await api('/credentials','PUT',{clear_kimi:true});await load();setNotice('Kimi 密钥已清除；环境变量配置需另行移除。');})}>清除 Kimi 密钥</button><button className="text-button" disabled={disabled} onClick={()=>action('清除密钥',async()=>{await api('/credentials','PUT',{clear_push:true});await load();setNotice('推送密钥已清除；环境变量配置需另行移除。');})}>清除推送密钥</button></div>
         </section>
         <details className="maintenance-group"><summary>导入持仓与交易流水</summary><AccountTools job={job} api={api} action={action} load={load} disabled={disabled} settings={config||data.settings}/></details>
-        {config&&<section className="form-section"><h2>更新、提醒与费用</h2><form onSubmit={e=>{e.preventDefault();action('保存设置',async()=>{const times=Array.from(new Set((config.daily_times||[config.daily_time]).map(normalizeBriefTime))).sort();const settings={...config,daily_times:times,daily_time:times[0]};await api('/settings','PUT',settings);setConfig(settings);await load();setNotice('设置已保存。电脑开机联网时后台按规则工作。');})}}>
-          <div className="form-grid"><label>模型标识<input value={config.model} onChange={e=>setConfig({...config,model:e.target.value})}/></label>
-            {[['monthly_limit','每月上限（元，最多200）'],['other_service_cost','其他服务月费（推送、数据等，元）'],['input_price','输入单价（元 / 百万 Token）'],['output_price','输出单价（元 / 百万 Token）'],['concentration','单股关注阈值（%）'],['move_threshold','价格变化阈值（%）']].map(([key,label])=><label key={key}>{label}<input type="number" step={key==='weekly_research_limit'?'1':'0.01'} min="0" required value={config[key]??'0'} onChange={e=>setConfig({...config,[key]:e.target.value})}/></label>)}
-          </div><BriefTimesInput values={config.daily_times||[config.daily_time]} onChange={daily_times=>setConfig({...config,daily_times})}/><label>报价来源<select value={config.quote_provider||'public'} onChange={e=>setConfig({...config,quote_provider:e.target.value})}><option value="public">公开行情（可能延迟，按报价时间判断）</option><option value="futu">富途本地OpenD（需账号行情权限）</option></select></label>{[['online_research','研究时自动联网检索与补充资料'],['prices_confirmed','已核对当前模型官方单价，允许付费调用'],['scheduler_enabled','启用定时收集（每30分钟）与每日简报'],['scheduler_paused','暂停开始新的定时任务（当前任务可完成）'],['push_enabled','启用微信推送（需绑定接收者）'],['auto_research','日报中启用 AI 原文分析（会产生费用）'],['event_research','新增重大资料时更新研究论点（会产生费用）']].map(([key,label])=><label className="check-label" key={key}><input type="checkbox" checked={!!config[key]} onChange={e=>setConfig({...config,[key]:e.target.checked})}/><span>{label}</span></label>)}
-          <p className="help">模型、搜索和抓取计入预算；超时保留预留费用。</p><button className="primary" disabled={disabled}>保存设置</button>
-        </form><div className="budget-line"><span>{data.budget.month} 本机记录费用（含填写的服务月费）：<strong>¥{fmt(data.budget.used)}</strong> / ¥{fmt(data.budget.limit)}</span>{data.budget.warning&&<strong className="loss">已达到预算的 80%</strong>}</div></section>}
+        {config&&<section className="form-section"><h2>更新、提醒与费用</h2><form onSubmit={e=>{e.preventDefault();action('保存设置',async()=>{const times=Array.from(new Set((config.daily_times||[config.daily_time]).map(normalizeBriefTime))).sort();const settings={...config,daily_times:times,daily_time:times[0]};const saved=await api('/settings','PUT',settings);setConfig(saved.settings||settings);await load();setNotice('设置已保存。电脑开机联网时后台按规则工作。');})}}>
+          <p className="help">模型与计费参数已内置，粘贴 Kimi API 密钥即可使用。</p><div className="form-grid">
+            {[['monthly_limit','每月上限（元，最多200）'],['other_service_cost','其他服务月费（推送、数据等，元）'],['concentration','单股关注阈值（%）'],['move_threshold','价格变化阈值（%）']].map(([key,label])=><label key={key}>{label}<input type="number" step={key==='weekly_research_limit'?'1':'0.01'} min="0" required value={config[key]??'0'} onChange={e=>setConfig({...config,[key]:e.target.value})}/></label>)}
+          </div><BriefTimesInput values={config.daily_times||[config.daily_time]} onChange={daily_times=>setConfig({...config,daily_times})}/><label>报价来源<select value={config.quote_provider||'public'} onChange={e=>setConfig({...config,quote_provider:e.target.value})}><option value="public">公开行情（可能延迟，按报价时间判断）</option><option value="futu">富途本地OpenD（需账号行情权限）</option></select></label>{[['online_research','研究时自动联网检索与补充资料'],['scheduler_enabled','启用定时收集（每30分钟）与每日简报'],['scheduler_paused','暂停开始新的定时任务（当前任务可完成）'],['push_enabled','启用微信推送（需绑定接收者）'],['auto_research','日报中启用 AI 原文分析（会产生费用）'],['event_research','新增重大资料时更新研究论点（会产生费用）']].map(([key,label])=><label className="check-label" key={key}><input type="checkbox" checked={!!config[key]} onChange={e=>setConfig({...config,[key]:e.target.checked})}/><span>{label}</span></label>)}
+          <details className="model-settings"><summary>高级模型设置</summary><label className="check-label"><input type="checkbox" checked={config.pricing_mode!=='manual'} onChange={e=>setConfig({...config,pricing_mode:e.target.checked?'builtin':'manual'})}/><span>使用内置 Kimi 配置</span></label>{config.pricing_mode==='manual'?<><div className="form-grid"><label>模型标识<input required value={config.model} onChange={e=>setConfig({...config,model:e.target.value})}/></label>{[['input_price','输入单价（元 / 百万 Token）'],['output_price','输出单价（元 / 百万 Token）']].map(([key,label])=><label key={key}>{label}<input type="number" step="0.01" min="0.01" required value={config[key]} onChange={e=>setConfig({...config,[key]:e.target.value})}/></label>)}</div><label className="check-label"><input type="checkbox" checked={!!config.prices_confirmed} onChange={e=>setConfig({...config,prices_confirmed:e.target.checked})}/><span>已核对自定义模型费率</span></label></>:<p className="help">Kimi K2.6 · 内置费率版本 {config.pricing_version}。费率随软件版本更新。</p>}</details>
+          <p className="help">费用按返回用量估算，以平台账单为准；超时保留预留费用。</p><button className="primary" disabled={disabled}>保存设置</button>
+        </form><div className="budget-line"><span>{data.budget.month} 本机费用估算（含服务月费）：<strong>¥{fmt(data.budget.used)}</strong> / ¥{fmt(data.budget.limit)}</span>{data.budget.warning&&<strong className="loss">已达到预算的 80%</strong>}</div></section>}
         <details className="maintenance-group"><summary>备份与运行记录</summary><section className="form-section"><div className="section-title"><h2>维护与备份</h2><a className="secondary" href="/api/backup" download><Download size={18}/>下载数据库备份</a></div><p className="help">备份含个人资产与资料，不含密钥，请妥善保存。恢复需先停止程序，按 README 操作。</p>
           <div className="button-row"><button className="secondary" disabled={disabled} onClick={()=>action('更新资料',()=>job('/quotes/refresh','更新报价'))}>更新行情</button><button className="secondary" disabled={disabled} onClick={()=>action('推送日报',()=>job('/brief','整理并推送日报',{send:true}))}>整理并推送今日简报</button></div><h3>最近运行记录</h3>{data.events.length?data.events.map(e=><div className="log-row" key={e.id}><small>{stamp(e.created_at)}</small><span>{e.message}</span></div>):<p className="muted">尚无运行记录。</p>}<h3>最近推送</h3>{data.notifications.length?data.notifications.map(n=><div className="log-row" key={n.id}><small>{stamp(n.created_at)}</small><span>{n.title} · {n.message}</span></div>):<p className="muted">尚未发送消息。</p>}
         </section></details><details className="maintenance-group"><summary>手动修正行情</summary><section className="form-section"><h2>补录行情</h2><p className="muted">数据源不可用时，可录入带日期和来源的报价。不会被标为自动核实数据。</p><form onSubmit={e=>{const f:any=formValues(e);const sid=f.sid;delete f.sid;if(!f.previous)delete f.previous;action('保存报价',async()=>{await api('/quotes/'+encodeURIComponent(sid),'POST',f);await load();setNotice('手动报价已保存。');})}}>

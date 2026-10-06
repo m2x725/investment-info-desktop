@@ -2,6 +2,7 @@ import json
 import re
 import uuid
 import threading
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -255,8 +256,8 @@ class Services:
                              (month, "reserved", "0", str(reserve), utcnow())).lastrowid
         try:
             payload, usage = self.kimi.complete(settings["model"], messages)
-            amount = (dec(settings["input_price"]) * int(usage["prompt_tokens"]) +
-                      dec(settings["output_price"]) * int(usage["completion_tokens"])) / Decimal(1000000)
+            from .model_profile import usage_cost
+            amount = usage_cost(settings, usage)
             self.store.execute("UPDATE expenses SET status='charged',amount=? WHERE id=?", (str(amount), eid))
             return payload
         except Exception:
@@ -348,15 +349,16 @@ class Services:
 
     def submit(self, kind, func):
         jid = uuid.uuid4().hex
-        self.store.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?)",
+        self.store.execute("INSERT INTO jobs(id,kind,status,message,result_id,created_at) VALUES(?,?,?,?,?,?)",
                            (jid, kind, "queued", "正在准备", None, utcnow()))
 
         def run():
             self.store.execute("UPDATE jobs SET status='running',message='正在处理，请稍候' WHERE id=?", (jid,))
             try:
                 self.job_context.id = jid
+                self.job_context.scope = (0, 100)
                 result = func()
-                self.store.execute("UPDATE jobs SET status='done',message='已完成',result_id=? WHERE id=?",
+                self.store.execute("UPDATE jobs SET status='done',message='已完成',progress=100,result_id=? WHERE id=?",
                                    (result if isinstance(result, int) else None, jid))
             except Exception as exc:
                 message = str(exc) if isinstance(exc, ProviderError) else "任务未完成，请到维护设置查看状态后重试。"
@@ -426,6 +428,7 @@ class Services:
 
     def followup(self, report_id, question):
         from .research_engine import material_pack, context_text, KEYWORDS
+        self.job_progress("正在读取已有报告与相关原文",10)
         rows = self.store.rows("SELECT * FROM reports WHERE id=? AND kind IN ('research','followup')", (report_id,))
         if not rows:
             raise ProviderError("研究报告不存在。")
@@ -439,8 +442,10 @@ class Services:
         topic=max(KEYWORDS,key=lambda k:len(re.findall(KEYWORDS[k],question,re.I)))
         report_size=len(json.dumps(report,ensure_ascii=False).encode())
         materials=material_pack(self.store,evidence,topic,byte_limit=max(0,80000-report_size))
+        self.job_progress('AI正在回答追问',45)
         response=self.ai_call([{'role':'system','content':SYSTEM+'\n回答当前追问，参考已有研究和相关原文选段。上下文选段不是全文；解释简单一点时保留关键风险与不确定性。'},
                                {'role':'user','content':json.dumps({'question':question,'report':report,'materials':materials},ensure_ascii=False)}])
+        self.job_progress("正在核验并保存回答",90)
         clean=self.validate_output(response,evidence,original.get('calculation'),row['security_id'],'followup')
         clean.update(calculation=original.get('calculation'),parent_report_id=report_id,as_of=utcnow())
         return self.store.execute('INSERT INTO reports(security_id,kind,payload,evidence_ids,created_at) VALUES(?,?,?,?,?)',
@@ -451,6 +456,7 @@ class Services:
         from .research_engine import ResearchEngine,context_text,readable,public_url
         if not self.news_lock.acquire(blocking=False):raise ProviderError('已有新闻分析在进行，请等待完成。')
         try:
+            self.job_progress('正在读取新闻原文',10)
             item=next((x for x in news_feed(self.store) if x['id']==news_id),None)
             if not item:raise ProviderError('这条新闻已不在当前列表，请更新新闻后重试。',unbilled=True)
             key=news_key(item)
@@ -475,8 +481,10 @@ class Services:
             eid=source[0]['id'] if source else self.store.execute('INSERT INTO evidence(title,url,published_at,content,kind,verification,fetched_at) VALUES(?,?,?,?,?,?,?)',
                 (item['title'],item['url'],item.get('published_at',''),content,'news','web_retrieved' if coverage=='抓取的网页正文' else 'search_excerpt',utcnow()))
             evidence=[{'id':eid,'content':content,'url':item['url'],'title':item['title']}]
+            self.job_progress('AI正在分析新闻影响',45)
             output=self.ai_call([{'role':'system','content':SYSTEM+'\n分析单条新闻：先说事件关键内容，再解释可能影响、适用公司或行业、反方和需要观察的指标。只使用所提供来源，不把仅标题或片段当完整事实。'},
                                  {'role':'user','content':json.dumps({'news':{k:item.get(k) for k in ('title','url','company','published_at')},'coverage':coverage,'materials':evidence},ensure_ascii=False)}])
+            self.job_progress('正在核验并保存分析',90)
             result=self.validate_output(output,evidence,stage='news')
             result.update(news_id=news_id,news_key=key,source_url=item['url'],source_title=item['title'],coverage_note=coverage,as_of=utcnow())
             result['validation_warnings']=warnings+result.get('validation_warnings',[])
@@ -537,14 +545,27 @@ class Services:
                 parts.append(marker+"\n"+content[start:start+600])
         return "\n\n[资料节选，可能不完整]\n".join(parts)[:4000]
 
-    def collection_progress(self, sid, message):
+    def collection_progress(self, sid, message, percent=None):
         self.store.save_settings({'collection:'+sid: {'status':'running','checked_at':utcnow(),'message':message}})
-        self.job_progress(message)
+        self.job_progress(message, percent)
 
-    def job_progress(self, message):
+    def job_progress(self, message, percent=None):
         jid = getattr(self.job_context, 'id', None)
         if jid:
-            self.store.execute("UPDATE jobs SET message=? WHERE id=?", (message,jid))
+            if percent is None:
+                self.store.execute("UPDATE jobs SET message=? WHERE id=?", (message,jid))
+            else:
+                start,end=getattr(self.job_context,'scope',(0,100))
+                value=min(99,max(0,round(start+(end-start)*percent/100)))
+                self.store.execute("UPDATE jobs SET message=?,progress=MAX(progress,?) WHERE id=? AND status='running'", (message,value,jid))
+
+    @contextmanager
+    def progress_scope(self, start, end):
+        previous=getattr(self.job_context,'scope',(0,100))
+        low,high=previous
+        self.job_context.scope=(low+(high-low)*start/100,low+(high-low)*end/100)
+        try:yield
+        finally:self.job_context.scope=previous
 
     def collect_company(self,sid,quote=True):
         lock=self.collection_locks.setdefault(sid,threading.Lock())
@@ -553,7 +574,7 @@ class Services:
             if not rows:raise ProviderError("公司不存在。")
             s=rows[0];failures=[];downloaded=0
             self.store.save_settings({"collection:"+sid:{"status":"running","checked_at":utcnow(),"message":"正在自动查找财报和公告"}})
-            self.collection_progress(sid,"正在更新行情")
+            self.collection_progress(sid,"正在更新行情",5)
             if quote:
                 try:
                     q=self.market.quote(s)
@@ -561,7 +582,7 @@ class Services:
                     save_quote(self.store,sid,q)
                 except Exception:failures.append("行情未更新")
             try:
-                self.collection_progress(sid,"正在查询交易所公告与财报目录")
+                self.collection_progress(sid,"正在查询交易所公告与财报目录",10)
                 documents=self.collector.documents(s)
                 for index,e in enumerate(documents):
                     previous=self.store.rows("SELECT * FROM evidence WHERE security_id=? AND url=? AND title=?",(sid,e["url"],e["title"]))
@@ -573,7 +594,7 @@ class Services:
                             " VALUES(?,?,?,?,?,?,?,?)",(sid,e['title'],e['url'],e['published_at'],e['title'],e['kind'],'title_only',utcnow()))
                         continue
                     try:
-                        self.collection_progress(sid,f"读取原文 {index+1}/{min(6,len(documents))}：{e['title']}（单份解析最多60秒）")
+                        self.collection_progress(sid,f"读取原文 {index+1}/{min(6,len(documents))}：{e['title']}（单份解析最多60秒）",15+60*index/max(1,min(6,len(documents))))
                         content=self.market.official_text(e["url"])
                         values=(sid,e["title"],e["url"],e["published_at"],content,e["kind"],"official_download",utcnow(),
                                 "官方PDF自动读取；按页保存，部分页可能使用备用解析/OCR")
@@ -591,7 +612,7 @@ class Services:
             except Exception as exc:
                 failures.append(str(exc) if isinstance(exc,ProviderError) else "官方财报与公告查询未完成")
             try:
-                self.collection_progress(sid,"正在查询结构化财务数据")
+                self.collection_progress(sid,"正在查询结构化财务数据",80)
                 f=self.collector.financials(s)
                 content=json.dumps(f,ensure_ascii=False)
                 previous=self.store.rows("SELECT id FROM evidence WHERE security_id=? AND verification='aggregated' AND content=?",(sid,content))
@@ -651,6 +672,7 @@ class Services:
         return sorted(alerts,key=lambda a:(a['priority']!='high',not a['key'].startswith('evidence:')))
 
     def brief(self, send=False, analyze=None, scheduled_time=None, fallback_note=None):
+        self.job_progress("正在整理简报来源",10)
         day = str(beijing_now().date())
         settings = self.store.settings()
         evidence = self.store.rows(
@@ -682,6 +704,7 @@ class Services:
         if (settings['auto_research'] if analyze is None else analyze) and items:
             from .research_engine import context_text
             material=[{'id':e['id'],'title':e['title'],'content':context_text(e['content'],7000)} for e in evidence if e['verification']!='title_only']
+            self.job_progress('AI正在总结简报要点',45)
             result=self.ai_call([{'role':'system','content':SYSTEM+'\n整理今日关键要点，并说明可能影响。另附 items 数组，每项为 {url,text}，url 必须来自输入，text 为该条资料的简洁总结；资料不足说明缺口，不输出空泛的“有关、可研究”。'},
                                  {'role':'user','content':json.dumps({'items':items,'materials':material},ensure_ascii=False)}])
             payload['analysis']=self.validate_output(result,evidence)
@@ -689,11 +712,13 @@ class Services:
             for item in items:
                 if item['url'] in summaries:item.update(text=summaries[item['url']],summary_kind='AI要点 · 推论需核对')
             payload['mode']='ai_digest'
+        self.job_progress("正在保存简报",90)
         rid = self.store.execute("INSERT INTO reports(kind,payload,evidence_ids,created_at) VALUES(?,?,?,?)",
                                  ("brief", json.dumps(payload, ensure_ascii=False), json.dumps([e["id"] for e in evidence]), utcnow()))
         if send:
             # Record generation before attempting delivery so an uncertain send does not regenerate paid analysis.
             self.store.save_settings({"last_daily_day": day})
+            self.job_progress("正在提交微信推送",95)
             self.deliver_brief(payload, day, scheduled_time)
         return rid
 

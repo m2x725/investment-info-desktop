@@ -23,7 +23,7 @@ def default_data_dir():
 
 
 DEFAULTS = {
-    "model": "kimi-k2.6", "monthly_limit": "200", "input_price": "0",
+    "pricing_mode": "auto", "model": "kimi-k2.6", "monthly_limit": "200", "input_price": "0",
     "output_price": "0", "prices_confirmed": False, "daily_time": "08:00",
     "scheduler_enabled": True, "scheduler_paused": False, "push_enabled": False, "auto_research": False, "event_research": False,
     "concentration": "15", "move_threshold": "5", "weekly_research_limit": 2, "other_service_cost": "0", "import_folder": "", "online_research": True,
@@ -96,6 +96,12 @@ class Store:
             db.execute("UPDATE jobs SET status='failed',message='上次运行中断，请重新开始。' WHERE status IN ('queued','running')")
             db.execute("UPDATE notifications SET status='unknown',message='上次运行中断，收件结果不明；请在微信核对。' WHERE status='sending'")
 
+        with self.connect() as db:
+            needs_progress = 'progress' not in {r['name'] for r in db.execute('PRAGMA table_info(jobs)')}
+        if needs_progress:
+            if self.existed_before_init:self.backup()
+            self.execute('ALTER TABLE jobs ADD COLUMN progress INTEGER NOT NULL DEFAULT 0')
+
         from .upgrade_schema import migrate
         migrate(self)
 
@@ -122,7 +128,8 @@ class Store:
             return db.execute(sql, args).lastrowid
 
     def settings(self):
-        return {r["key"]: json.loads(r["value"]) for r in self.rows("SELECT * FROM settings")}
+        from .model_profile import resolve_profile
+        return resolve_profile({r["key"]: json.loads(r["value"]) for r in self.rows("SELECT * FROM settings")})
 
     def save_settings(self, values):
         with self.connect() as db:

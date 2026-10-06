@@ -55,7 +55,8 @@ def test_input_boundaries_and_local_origin(api):
     assert c.post("/api/positions",json={**body,"quantity":"NaN"}).status_code == 422
     sid=add(c,"SH","600519")
     assert c.post("/api/quotes/"+sid,json=dict(price="10",as_of=str(beijing_now().date()+timedelta(days=1)),source="测试")).status_code == 422
-    assert c.put("/api/settings",json={"prices_confirmed":True}).status_code == 422
+    assert c.put("/api/settings",json={"prices_confirmed":True}).status_code == 200
+    assert c.put("/api/settings",json={"pricing_mode":"manual","prices_confirmed":True}).status_code == 422
 
 
 def service(tmp_path):
