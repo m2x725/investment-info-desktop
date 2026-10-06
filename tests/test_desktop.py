@@ -2,6 +2,20 @@ from types import SimpleNamespace
 from backend.desktop import WindowController
 
 
+def test_window_navigation_is_fresh_and_preserves_url():
+    from backend.desktop import fresh_window_url, APP_VERSION
+    from urllib.parse import urlsplit, parse_qs
+    original = 'http://127.0.0.1:8765/?mode=research&app_version=old&launch=old#report'
+    first, second = fresh_window_url(original), fresh_window_url(original)
+    parts = urlsplit(first)
+    query = parse_qs(parts.query)
+    assert parts.netloc == '127.0.0.1:8765' and parts.fragment == 'report'
+    assert query['mode'] == ['research']
+    assert query['app_version'] == [APP_VERSION]
+    assert len(query['launch']) == 1 and query['launch'][0] != 'old'
+    assert query['launch'] != parse_qs(urlsplit(second).query)['launch']
+
+
 class Window:
     def __init__(self): self.calls = []
     def hide(self): self.calls.append('hide')

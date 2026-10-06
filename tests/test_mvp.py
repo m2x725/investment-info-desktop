@@ -59,6 +59,14 @@ def test_input_boundaries_and_local_origin(api):
     assert c.put("/api/settings",json={"pricing_mode":"manual","prices_confirmed":True}).status_code == 422
 
 
+def test_frontend_html_is_not_cached_between_upgrades(api):
+    c, _ = api
+    page = c.get('/?app_version=test&launch=new')
+    assert page.status_code == 200
+    assert page.headers['content-type'].startswith('text/html')
+    assert page.headers['cache-control'] == 'no-store'
+
+
 def service(tmp_path):
     store=Store(tmp_path); creds=Credentials();creds.memory["kimi"]="test-secret"
     svc=Services(store,Mock(),Mock(),Mock(),creds)

@@ -1,6 +1,19 @@
 """Native window lifecycle. No API bridge or external page privileges are exposed."""
 import threading
+import secrets
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from contextlib import contextmanager
+
+APP_VERSION = '0.1.4'
+
+
+def fresh_window_url(url):
+    """A new navigation key prevents a persistent WebView from reusing old HTML."""
+    parts = urlsplit(url)
+    query = [(key, value) for key, value in parse_qsl(parts.query)
+             if key not in ('app_version', 'launch')]
+    query.extend([('app_version', APP_VERSION), ('launch', secrets.token_hex(12))])
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
 @contextmanager
@@ -61,7 +74,7 @@ def start_window(server, app, url, storage_path, windows=False):
     import webview
     webview.settings['ALLOW_DOWNLOADS'] = True
     webview.settings['OPEN_EXTERNAL_LINKS_IN_BROWSER'] = True
-    window = webview.create_window('投资信息台', url, width=1180, height=820,
+    window = webview.create_window(f'投资信息台 · v{APP_VERSION}', fresh_window_url(url), width=1180, height=820,
                                   min_size=(760, 560), text_select=True, zoomable=True,
                                   background_color='#f5f5f7')
     controller = WindowController(window, server)
@@ -91,7 +104,7 @@ def start_window(server, app, url, storage_path, windows=False):
             except Exception:
                 # Keep the window usable and let its close button stop the backend.
                 tray.stop()
-                window.title = '投资信息台（托盘不可用，关闭即退出）' 
+                window.title = f'投资信息台 · v{APP_VERSION}（托盘不可用，关闭即退出）'
 
         # A failed backend must not leave a working-looking window in the tray.
         def monitor():

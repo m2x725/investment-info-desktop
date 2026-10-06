@@ -54,7 +54,8 @@ def create_app(data_dir=None, scheduler=True):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Content-Security-Policy"] = "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
-        if request.url.path.startswith("/api/"):
+        if (request.url.path.startswith("/api/") or
+                response.headers.get("content-type", "").startswith("text/html")):
             response.headers["Cache-Control"] = "no-store"
         return response
 
