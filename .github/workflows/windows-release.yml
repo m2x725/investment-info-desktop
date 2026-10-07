@@ -5,7 +5,7 @@ on:
       version:
         description: 'Version, for example 0.1.0'
         required: true
-        default: '0.1.0'
+        default: '0.1.7'
 permissions:
   contents: read
 jobs:
@@ -32,6 +32,8 @@ jobs:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           if ($env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+$') { throw 'Use a numeric version such as 0.1.0.' }
+          $appVersion = (python -c "from backend.desktop import APP_VERSION; print(APP_VERSION)").Trim()
+          if ($env:RELEASE_VERSION -ne $appVersion) { throw 'Release version must match application version.' }
           python scripts/Prepare-Release.py --check
       - name: Install dependencies and build frontend
         run: |
