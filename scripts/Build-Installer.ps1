@@ -1,7 +1,10 @@
-param([string]$Version = '0.1.0')
+param([string]$Version = '')
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot -Parent)
+$sourceVersion = (& .\.venv\Scripts\python.exe -c "from backend.desktop import APP_VERSION; print(APP_VERSION)").Trim()
+if (!$Version) { $Version = $sourceVersion }
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid version.' }
+if ($LASTEXITCODE -ne 0 -or $Version -ne $sourceVersion) { throw "Installer version $Version differs from application version $sourceVersion." }
 $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
 if (!(Test-Path $iscc)) { throw 'Install Inno Setup 6 from https://jrsoftware.org/isdl.php first.' }
 New-Item -ItemType Directory -Path dist/prerequisites -Force | Out-Null
