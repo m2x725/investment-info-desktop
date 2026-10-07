@@ -300,14 +300,14 @@ class Push:
     def send(self, title, content):
         key = self.credentials.get("push")
         if not key:
-            raise ProviderError("微信推送未配置，请在维护设置中填写 Server酱 SendKey。")
+            raise ProviderError("微信推送未配置，请在维护设置中填写 Server酱 SendKey。",unbilled=True)
         if not key.startswith("SCT") or not key.isalnum():
-            raise ProviderError("仅支持 Server酱 Turbo 的 SCT 密钥，请核对。")
+            raise ProviderError("仅支持 Server酱 Turbo 的 SCT 密钥，请核对。",unbilled=True)
         try:
             r = self.client.post(f"https://sctapi.ftqq.com/{key}.send", data={"title": title, "desp": content})
             r.raise_for_status()
             if r.json().get("code") != 0:
-                raise ProviderError("推送服务拒绝请求，请检查额度及接收绑定。")
+                raise ProviderError("推送服务拒绝请求，请检查额度及接收绑定。",unbilled=True)
         except ProviderError:
             raise
         except Exception as exc:

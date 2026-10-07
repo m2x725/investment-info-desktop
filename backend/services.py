@@ -227,6 +227,8 @@ class Services:
         self.ai_limit = threading.BoundedSemaphore(2)
         self.stop = threading.Event()
         self.scheduler = None
+        self.brief_scheduler = None
+        self.brief_lock = threading.Lock()
 
     def budget(self):
         month = beijing_now().strftime("%Y-%m")
@@ -377,6 +379,7 @@ class Services:
 
     def submit(self, kind, func):
         from .cancellation import JobControl, JobCancelled
+        if self.stop.is_set():raise ProviderError("程序正在退出，未开始新任务。",unbilled=True)
         jid = uuid.uuid4().hex
         control = JobControl()
         with self.controls_lock:self.job_controls[jid] = control
@@ -397,8 +400,16 @@ class Services:
                 result = func()
                 with control.lock:
                     control.check()
-                    self.store.execute("UPDATE jobs SET status='done',message='已完成',progress=100,result_id=? WHERE id=?",
-                                   (result if isinstance(result, int) else None, jid))
+                    rid=result if isinstance(result,int) else None
+                    coverage={}
+                    if rid:
+                        rows=self.store.rows('SELECT payload FROM reports WHERE id=?',(rid,))
+                        if rows:coverage=json.loads(rows[0]['payload']).get('coverage',{})
+                    completed=coverage.get('completed_sections',0);total=coverage.get('total_sections',0)
+                    partial=bool(total and completed<total)
+                    self.store.execute("UPDATE jobs SET status=?,message=?,progress=?,result_id=? WHERE id=?",
+                        ('partial' if partial else 'done',f'已完成 {completed}/{total} 章节，部分内容未完成' if partial else '已完成',
+                         int(completed/total*100) if partial else 100,rid,jid))
             except JobCancelled:
                 with control.lock:
                     with self.store.connect() as db:
@@ -424,7 +435,13 @@ class Services:
                 self.job_context.control = None
                 self.store.write_context.control = None
                 with self.controls_lock:self.job_controls.pop(jid, None)
-        control.future = self.executor.submit(run)
+        with self.controls_lock:
+            if self.stop.is_set():
+                control.cancelled.set()
+                self.store.execute("UPDATE jobs SET status='cancelled',message='程序退出，任务未开始' WHERE id=?",(jid,))
+                self.job_controls.pop(jid,None)
+            else:
+                control.future = (getattr(self,'background_executor',self.executor) if kind in ('background_update','scheduled_brief') else self.executor).submit(run)
         return jid
 
     def parallel(self, items, func, workers=2):
@@ -462,7 +479,7 @@ class Services:
         if control:metadata=control.metadata()
         row.update(metadata)
         preview=self.job_preview(jid)
-        if row['status']=='done' and row['result_id']:
+        if row['status'] in ('done','partial') and row['result_id']:
             reports=self.store.rows('SELECT payload FROM reports WHERE id=?',(row['result_id'],))
             if reports:preview={'payload':json.loads(reports[0]['payload'])}
         row['completed_sections']=preview.get('payload',{}).get('coverage',{}).get('completed_sections',0)
@@ -472,7 +489,7 @@ class Services:
     def job_preview(self, jid):
         row=self.store.rows('SELECT * FROM jobs WHERE id=?',(jid,))[0]
         if row['status'] in ('cancelled','cancelling'):return {'available':False}
-        if row['status']=='done':return {'available':False,'report_id':row['result_id']}
+        if row['status'] in ('done','partial'):return {'available':False,'report_id':row['result_id']}
         run=json.loads(row.get('metadata','{}')).get('preview_run')
         if not run:return {'available':False}
         runs=self.store.rows('SELECT * FROM research_runs WHERE id=?',(run,))
@@ -520,7 +537,7 @@ class Services:
                 except ProviderError:
                     prior=cfg.get('provider_profile')
                     rates={prior['model']:prior} if prior else {PROFILE['model']:PROFILE}
-                    warning='官方费率暂未更新，按上次核实费率估算。'
+                    warning='官方费率暂未更新，按已保存费率估算。' if prior else '官方费率暂不可用，按内置费率估算；以平台账单为准。'
                 self.check_cancelled()
                 profile=select_api_profile(models,rates)
                 stamp=utcnow()
@@ -962,9 +979,18 @@ class Services:
             raise ProviderError("微信密钥尚未配置。")
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            existing = db.execute("SELECT status FROM notifications WHERE dedupe_key=?", (key,)).fetchone()
-            if existing:
+            existing = db.execute("SELECT status,created_at FROM notifications WHERE dedupe_key=?", (key,)).fetchone()
+            if existing and existing["status"]!='rejected':
                 return existing["status"]
+            retry_key='delivery_attempts:'+key
+            saved=db.execute('SELECT value FROM settings WHERE key=?',(retry_key,)).fetchone()
+            attempts=json.loads(saved['value']) if saved else 0
+            if existing:
+                age=(datetime.now(timezone.utc)-datetime.fromisoformat(existing['created_at'])).total_seconds()
+                if attempts>=3 or age<min(300,60*max(1,attempts)):
+                    return 'rejected'
+                db.execute('DELETE FROM notifications WHERE dedupe_key=?',(key,))
+            db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',(retry_key,json.dumps(attempts+1)))
             nid = db.execute("INSERT INTO notifications(dedupe_key,day,status,title,content,message,created_at)"
                              " VALUES(?,?,?,?,?,?,?)",
                              (key, day, "sending", title[:100], content[:10000], "等待推送服务", utcnow())).lastrowid
@@ -974,11 +1000,23 @@ class Services:
             return "accepted"
         except Exception as exc:
             message = str(exc) if isinstance(exc, ProviderError) else "推送失败或结果不明"
-            self.store.execute("UPDATE notifications SET status='unknown',message=? WHERE id=?", (message, nid))
+            self.store.execute("UPDATE notifications SET status=?,message=? WHERE id=?", ("rejected" if getattr(exc,"unbilled",False) else "unknown",message,nid))
             self.store.event("push", message)
             raise ProviderError(message)
 
+    def resend_notification(self, nid):
+        rows=self.store.rows('SELECT * FROM notifications WHERE id=?',(nid,))
+        if not rows:raise ProviderError('推送记录不存在。')
+        row=rows[0]
+        if row['status']=='sending':raise ProviderError('这条消息仍在发送，请稍后核对。')
+        # Explicit resend uses saved content and a new delivery identity; never regenerate AI.
+        return self.notify('resend:'+str(nid)+':'+uuid.uuid4().hex,row['title'],row['content'])
+
     def scheduled_briefs(self, now, cfg, refresh=True):
+        with cancellable_lock(self.brief_lock):
+            return self._scheduled_briefs(now,cfg,refresh)
+
+    def _scheduled_briefs(self, now, cfg, refresh=True):
         day=str(now.date());hm=now.strftime('%H:%M')
         slots=[t for t in sorted(set(cfg['daily_times'])) if t<=hm]
         if not slots:return
@@ -988,8 +1026,10 @@ class Services:
             if not self.store.settings().get(key):self.store.save_settings({key:{'status':'skipped'}})
         t=slots[-1];key=f'brief_slot:{day}:{t}'
         state=self.store.settings().get(key)
-        if self.store.rows('SELECT id FROM notifications WHERE dedupe_key=?',(f'daily:{day}:{t}',)):return
-        if not state or state.get('status')=='failed':
+        if self.store.rows("SELECT id FROM notifications WHERE dedupe_key=? AND status!='rejected'",(f'daily:{day}:{t}',)):return
+        if state and state.get('status')=='saved' and not self.store.rows('SELECT id FROM reports WHERE id=?',(state.get('report_id'),)):
+            state={'status':'failed'}
+        if not state or state.get('status') in ('failed','generating'):
             recovering=bool(state)
             self.store.save_settings({key:{'status':'generating'}})
             try:
@@ -1018,7 +1058,7 @@ class Services:
             row=self.store.rows('SELECT payload FROM reports WHERE id=?',(state['report_id'],))
             if row:self.deliver_brief(json.loads(row[0]['payload']),day,t)
 
-    def tick(self, now=None):
+    def tick(self, now=None, include_briefs=True):
         now = now or beijing_now()
         cfg = self.store.settings()
         if not cfg["scheduler_enabled"] or cfg.get("scheduler_paused"):
@@ -1035,7 +1075,7 @@ class Services:
         hm = now.strftime("%H:%M")
         last = cfg.get("last_tick")
         due = not last or (now-datetime.fromisoformat(last)).total_seconds() >= 1800
-        daily_due = not cfg.get("daily_times") and hm >= cfg["daily_time"] and cfg.get("last_daily_day") != day
+        daily_due = include_briefs and not cfg.get("daily_times") and hm >= cfg["daily_time"] and cfg.get("last_daily_day") != day
         if due or daily_due:
             try:self.refresh()
             except Exception:
@@ -1050,7 +1090,7 @@ class Services:
         # Generation and delivery are separate. Enabling push or changing the
         # time after today's digest was generated must not silently skip delivery.
         # An accepted or uncertain notification remains deduplicated.
-        if not cfg.get('daily_times') and not daily_due and hm >= cfg['daily_time'] and cfg['push_enabled'] and self.credentials.get('push'):
+        if include_briefs and not cfg.get('daily_times') and not daily_due and hm >= cfg['daily_time'] and cfg['push_enabled'] and self.credentials.get('push'):
             sent = self.store.rows('SELECT status FROM notifications WHERE dedupe_key=?', (f'daily:{day}',))
             if not sent:
                 saved = self.store.rows("SELECT payload FROM reports WHERE kind='brief' ORDER BY id DESC LIMIT 1")
@@ -1059,7 +1099,7 @@ class Services:
                     if payload.get('title') == f'{day} 今日关注':
                         self.deliver_brief(payload, day)
                         self.store.event('push', '今日已保存简报已提交微信推送，未重复调用 AI。')
-        if cfg.get('daily_times'):
+        if include_briefs and cfg.get('daily_times'):
             self.scheduled_briefs(now, cfg, refresh=not due)
         alerts=self.alerts()
         if cfg.get('event_research') and self.credentials.get('kimi') and self.research_lock.acquire(blocking=False):
@@ -1075,12 +1115,9 @@ class Services:
             finally:self.research_lock.release()
         if cfg["push_enabled"] and self.credentials.get("push"):
             pending = [a for a in self.alerts() if a["priority"]=="high" and not self.store.rows(
-                "SELECT id FROM notifications WHERE dedupe_key=?", (a["key"],))]
-            for alert in pending[:3]:
-                sent = self.store.rows("SELECT COUNT(*) AS n FROM notifications WHERE day=? AND dedupe_key NOT LIKE 'daily:%' "
-                                       "AND dedupe_key NOT LIKE 'test:%'", (day,))[0]["n"]
-                if sent >= 3:
-                    break
+                "SELECT id FROM notifications WHERE dedupe_key=? AND status!='rejected'", (a["key"],))]
+            for alert in pending:
+                self.check_cancelled()
                 if alert.get('security_id'):
                     updates=self.store.rows("SELECT payload FROM reports WHERE security_id=? AND kind='event_update' ORDER BY id DESC LIMIT 1",(alert['security_id'],))
                     if updates:alert['text']+='\n\n研究更新：'+json.loads(updates[0]['payload'])['summary']
@@ -1088,21 +1125,54 @@ class Services:
                     "\n\n[来源](" + alert["url"] + ")" if alert.get("url") else ""))
 
     def start_scheduler(self):
-        def loop():
-            cfg=self.store.settings()
-            if cfg['scheduler_enabled'] and not cfg.get('scheduler_paused'):
-                try:self.refresh_fx(force=True)
-                except ProviderError:pass
+        def run_loop(kind, operation, interval):
             while not self.stop.is_set():
+                cfg=self.store.settings()
+                if not cfg['scheduler_enabled'] or cfg.get('scheduler_paused'):
+                    self.stop.wait(interval);continue
+                if kind=='scheduled_brief':
+                    now=beijing_now();times=cfg.get('daily_times') or [cfg['daily_time']]
+                    elapsed=[t for t in times if t<=now.strftime('%H:%M')]
+                    if not elapsed:
+                        self.stop.wait(interval);continue
+                    key=f'daily:{now.date()}:{max(elapsed)}'
+                    delivery=self.store.rows('SELECT status FROM notifications WHERE dedupe_key=?',(key,))
+                    slot=self.store.settings().get(f'brief_slot:{now.date()}:{max(elapsed)}',{})
+                    if delivery and delivery[0]['status']!='rejected' or slot.get('status')=='saved' and not cfg['push_enabled']:
+                        self.stop.wait(interval);continue
                 try:
-                    self.tick()
-                except Exception as exc:
-                    msg = str(exc) if isinstance(exc, ProviderError) else "后台更新未完成，稍后重试。"
-                    self.store.event("scheduler", msg)
-                self.stop.wait(60)
-        self.scheduler = threading.Thread(target=loop, daemon=True, name="wealth-scheduler")
-        self.scheduler.start()
+                    jid=self.submit(kind,operation)
+                    with self.controls_lock:control=self.job_controls.get(jid)
+                    if control and control.future:control.future.result()
+                    # Background results live in reports/notifications/events, not task history.
+                    self.store.execute("DELETE FROM jobs WHERE id=? AND status='done'",(jid,))
+                except JobCancelled:pass
+                except Exception:
+                    if not self.stop.is_set():self.store.event('scheduler','后台任务未完成，请查看运行记录。')
+                self.stop.wait(interval)
+        def daily():
+            cfg=self.store.settings()
+            if not cfg['scheduler_enabled'] or cfg.get('scheduler_paused'):return
+            # Independent trigger: collection never blocks the delivery time slot.
+            if not cfg.get('daily_times'):cfg={**cfg,'daily_times':[cfg['daily_time']]}
+            self.scheduled_briefs(beijing_now(),cfg,refresh=False)
+        # Separate executors prevent queued user analyses starving scheduled delivery.
+        self.background_executor=ThreadPoolExecutor(max_workers=2,thread_name_prefix='wealth-background')
+        def launch(kind,operation):
+            # submit() chooses the background executor by kind.
+            run_loop(kind,operation,15 if kind=='scheduled_brief' else 60)
+        self.scheduler=threading.Thread(target=launch,args=('background_update',lambda:self.tick(include_briefs=False)),daemon=True)
+        self.brief_scheduler=threading.Thread(target=launch,args=('scheduled_brief',daily),daemon=True)
+        self.scheduler.start();self.brief_scheduler.start()
+
+    def request_stop(self):
+        self.stop.set()
+        with self.controls_lock:ids=list(self.job_controls)
+        for jid in ids:self.cancel_job(jid)
 
     def close(self):
-        self.stop.set()
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.request_stop()
+        self.executor.shutdown(wait=True,cancel_futures=True)
+        if hasattr(self,'background_executor'):self.background_executor.shutdown(wait=True,cancel_futures=True)
+        for worker in (self.scheduler,self.brief_scheduler):
+            if worker and worker is not threading.current_thread():worker.join(timeout=2)

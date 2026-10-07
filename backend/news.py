@@ -65,6 +65,14 @@ def news_feed(store):
     unique={}
     for item in sorted(items,key=lambda x:x.get('published_at') or '',reverse=True):
         if item['url'] not in unique:unique[item['url']]=item
+    # Keep every source, but place company-linked material ahead of unrelated RSS.
+    # This is transparent title-based ranking, not an AI materiality judgement.
+    def relevance(item):
+        title=item['title']
+        routine=bool(re.search('翌日披露|月報|月报',title))
+        important=bool(re.search('盈利警告|盈警|业绩|業績|年度报告|年度報告|中期|收购|收購|调查|調查|违约|違約',title))
+        return (bool(item.get('company')) and not routine,important,not routine,item.get('published_at') or '')
+    unique=dict(sorted(unique.items(),key=lambda pair:relevance(pair[1]),reverse=True))
     analyses={}
     for row in store.rows("SELECT id,payload,created_at FROM reports WHERE kind='news_analysis' ORDER BY id DESC"):
         payload=json.loads(row['payload']);analyses.setdefault(payload.get('news_key'),{**row,'payload':payload})

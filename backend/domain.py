@@ -221,6 +221,18 @@ def valuation(store, sid):
     return result
 
 
+def quote_stale(quote, today=None):
+    """Shared conservative freshness rule; preserve estimates while flagging old quotes.
+
+    Four calendar days tolerates normal weekends, not a claim of live market data.
+    Exchange holiday calendars remain a separately labelled limitation.
+    """
+    today=today or (datetime.now(timezone.utc)+timedelta(hours=8)).date()
+    if not quote or not quote.get('as_of'):return True
+    try:return (today-date.fromisoformat(quote['as_of'])).days>4
+    except (TypeError,ValueError):return True
+
+
 def portfolio(store):
     positions = store.rows("SELECT s.*,p.quantity,p.cost,p.note,p.updated_at,q.price,q.previous,"
                            "q.as_of,q.source,q.fetched_at FROM positions p JOIN securities s ON s.id=p.security_id "
@@ -232,7 +244,7 @@ def portfolio(store):
     complete = True
     today = (datetime.now(timezone.utc) + timedelta(hours=8)).date()
     for p in positions:
-        p["stale"] = bool(p["as_of"] and (today - date.fromisoformat(p["as_of"])).days > 4)
+        p["stale"] = quote_stale(p,today)
         if p["price"] is None:
             p.update(market_value=None, gain=None, base_value=None)
             complete = False

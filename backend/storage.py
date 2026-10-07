@@ -171,4 +171,6 @@ class Store:
         target = folder / f'portfolio-{datetime.now().strftime("%Y%m%d-%H%M%S-%f")}.db'
         with self.connect() as db, closing(sqlite3.connect(target)) as dest:
             db.backup(dest)
+            if dest.execute('PRAGMA integrity_check').fetchone()[0]!='ok':
+                raise RuntimeError('数据库备份完整性检查失败，未确认备份成功。')
         return target

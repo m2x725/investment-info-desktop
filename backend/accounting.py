@@ -3,7 +3,7 @@ import json,math
 from collections import defaultdict
 from datetime import date,datetime,timedelta,timezone
 from decimal import Decimal
-from .domain import dec,money,portfolio
+from .domain import quote_stale, dec,money,portfolio
 from .providers import ProviderError
 from .storage import utcnow
 ZERO=Decimal(0)
@@ -80,7 +80,7 @@ def overview(store):
         for sid,v in state['positions'].items():
             if v['quantity']==0:continue
             s=store.rows('SELECT * FROM securities WHERE id=?',(sid,))[0];q=store.rows('SELECT * FROM quotes WHERE security_id=?',(sid,));conversion=Decimal(1) if s['currency']=='CNY' else rate
-            p={**s,**(q[0] if q else {}),'quantity':str(v['quantity']),'cost':str(v['cost_cny']/v['quantity']),'accounting_cost_cny':money(v['cost_cny']),'cost_currency':'CNY','gain':None,'stale':not q,'market_value':None,'base_value':None,'gain_cny':None,**broker.get(sid,{})}
+            p={**s,**(q[0] if q else {}),'quantity':str(v['quantity']),'cost':str(v['cost_cny']/v['quantity']),'accounting_cost_cny':money(v['cost_cny']),'cost_currency':'CNY','gain':None,'stale':quote_stale(q[0] if q else None),'market_value':None,'base_value':None,'gain_cny':None,**broker.get(sid,{})}
             p['quantity']=str(v['quantity']);cost+=v['cost_cny']
             if q and conversion:
                 value=dec(q[0]['price'])*v['quantity'];base=value*conversion;total+=base

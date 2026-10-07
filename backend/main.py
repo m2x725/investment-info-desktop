@@ -80,7 +80,7 @@ def create_app(data_dir=None, scheduler=True):
                             "WHERE kind NOT IN ('brief','news_analysis') ORDER BY id DESC LIMIT 20")
         for row in reports:
             row["payload"] = json.loads(row["payload"])
-        return {"csrf": csrf, "portfolio": overview(store), "followed": store.followed(),
+        return {"csrf": csrf, "active_jobs":store.rows("SELECT id,kind,message FROM jobs WHERE status IN ('queued','running','cancelling') AND kind NOT IN ('background_update','scheduled_brief') ORDER BY created_at"), "portfolio": overview(store), "followed": store.followed(),
                 "watchlist": store.rows("SELECT s.* FROM watchlist w JOIN securities s ON s.id=w.security_id"),
                 "alerts": services.alerts(), "news":news_feed(store), "brief": {**latest[0], "payload": json.loads(latest[0]["payload"])} if latest else None,
                 "reports": reports, "settings": store.settings(), "budget": services.budget(),
@@ -311,6 +311,11 @@ def create_app(data_dir=None, scheduler=True):
         if not store.rows('SELECT id FROM jobs WHERE id=?',(jid,)):
             raise HTTPException(404, '任务不存在')
         return services.cancel_job(jid)
+
+    @app.post('/api/notifications/{nid}/resend')
+    def resend(nid:int,body:dict):
+        if body.get('confirm') is not True:raise HTTPException(400,'重发可能重复收件，请确认后继续。')
+        return {'job_id':services.submit('push_resend',lambda:services.resend_notification(nid))}
 
     @app.put("/api/settings")
     def settings(body: Settings):

@@ -4,7 +4,7 @@ import secrets
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from contextlib import contextmanager
 
-APP_VERSION = '0.1.6'
+APP_VERSION = '0.1.7'
 
 
 def fresh_window_url(url):
@@ -42,9 +42,10 @@ def instance_guard(windows=False):
 
 
 class WindowController:
-    def __init__(self, window, server):
+    def __init__(self, window, server, stop_tasks=None):
         self.window = window
         self.server = server
+        self.stop_tasks = stop_tasks or (lambda:None)
         self.tray = None
         self.quitting = threading.Event()
 
@@ -53,6 +54,7 @@ class WindowController:
         if self.tray is not None and not self.quitting.is_set():
             self.window.hide()
             return False
+        self.stop_tasks()
         self.server.should_exit = True
         return True
 
@@ -64,6 +66,7 @@ class WindowController:
         if self.quitting.is_set():
             return
         self.quitting.set()
+        self.stop_tasks()
         self.server.should_exit = True
         if self.tray is not None:
             self.tray.stop()
@@ -77,7 +80,7 @@ def start_window(server, app, url, storage_path, windows=False):
     window = webview.create_window(f'投资信息台 · v{APP_VERSION}', fresh_window_url(url), width=1180, height=820,
                                   min_size=(760, 560), text_select=True, zoomable=True,
                                   background_color='#f5f5f7')
-    controller = WindowController(window, server)
+    controller = WindowController(window, server, app.state.services.request_stop)
     window.events.closing += controller.closing
 
     def on_started():
