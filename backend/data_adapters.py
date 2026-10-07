@@ -69,9 +69,11 @@ def collect_financial_history(store,s):
                      else [sys.executable,'-m','backend.history_worker'])
             options={'creationflags':subprocess.CREATE_NO_WINDOW} if sys.platform=='win32' else {}
             env={**os.environ,'OMP_NUM_THREADS':'2','OPENBLAS_NUM_THREADS':'2','MKL_NUM_THREADS':'2'}
-            result=subprocess.run(command+[str(source),str(output)],timeout=45,env=env,
-                                  stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,**options)
-            if result.returncode or not output.exists():raise ValueError('history worker failed')
+            from .task_io import wait_process
+            with subprocess.Popen(command+[str(source),str(output)],env=env,
+                                  stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,**options) as process:
+                wait_process(process,45)
+            if process.returncode or not output.exists():raise ValueError('history worker failed')
             statements=json.loads(output.read_text(encoding='utf-8'))
         for period in sorted(statements,reverse=True)[:4]:
             payload={'statements':statements[period],'currency':'UNKNOWN' if s['exchange']=='HK' else 'CNY','unit':'原接口金额字段；港股单位待与报告核对','verification':'aggregated_unreconciled'}

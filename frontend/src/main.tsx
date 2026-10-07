@@ -1,4 +1,4 @@
-import React, {useState, useEffect} from 'react';
+import React, {useState, useEffect, useRef} from 'react';
 import {createRoot} from 'react-dom/client';
 import {ArrowRight, BookOpen, BriefcaseBusiness, Check, ChevronRight, Eye, EyeOff, FileText, Leaf, LoaderCircle, Plus, RefreshCw, Search, Settings2, ShieldCheck, X, ExternalLink, CircleAlert, Download, Bell} from 'lucide-react';
 import './style.css';
@@ -30,7 +30,8 @@ function App(){
   const [editing,setEditing]=useState<any>(null),[showHolding,setShowHolding]=useState(false);
   const [evidence,setEvidence]=useState<any[]>([]),[showEvidence,setShowEvidence]=useState(false);
   const [credentialForm,setCredentialForm]=useState({kimi_key:'',push_key:''});
-  const [task,setTask]=useState<{id:string;label:string;completion?:string;detail?:string;progress?:number;cancelling?:boolean}|null>(null);
+  const previewSeen=useRef('');
+  const [task,setTask]=useState<{id:string;label:string;completion?:string;detail?:string;progress?:number;cancelling?:boolean;elapsed?:number;completed?:number;total?:number}|null>(null);
   const [removeId,setRemoveId]=useState('');
   const [feedbackHeight,setFeedbackHeight]=useState(0);
   const [completedResult,setCompletedResult]=useState<any>(null);
@@ -72,12 +73,19 @@ function App(){
       try{
         const j=await api('/jobs/'+task.id);
         if(!active)return;
-        if((j.status==='running'||j.status==='queued')&&j.message)setTask(current=>current?.id===task.id?{...current,detail:j.message,progress:j.progress}:current);
+        if((j.status==='running'||j.status==='queued')&&j.message)setTask(current=>current?.id===task.id?{...current,detail:j.message,progress:j.progress,elapsed:j.elapsed_seconds,completed:j.completed_sections,total:j.total_sections}:current);
+        if(j.status==='running'&&j.completed_sections>0){
+          const revision=j.preview_run+':'+j.completed_sections;
+          if(previewSeen.current!==revision){
+            const preview=await api('/jobs/'+task.id+'/preview');
+            if(active&&preview.available){previewSeen.current=revision;setReport(preview);setPage('research');if(preview.security_id)setSelected(preview.security_id);}
+          }
+        }
         if(j.status==='cancelling')setTask(current=>current?.id===task.id?{...current,cancelling:true,detail:j.message}:current);
-        if(j.status==='cancelled'){clearInterval(timer);const fresh=await load();if(active){setTask(null);setCompletedResult(null);setReport((current:any)=>current&& !fresh.reports.some((r:any)=>r.id===current.id)?null:current);setNotice('已取消，本次报告与草稿未保存。');}return;}
+        if(j.status==='cancelled'){clearInterval(timer);const fresh=await load();if(active){setTask(null);setCompletedResult(null);setReport((current:any)=>current?.preview&&current.job_id===task.id?null:current);setNotice('已取消，本次报告与草稿未保存。');}return;}
         if(j.status==='done'||j.status==='failed'){
           clearInterval(timer);await load();
-          if(j.status==='failed')setError(j.message);
+          if(j.status==='failed'){setError(j.message);setReport((current:any)=>current?.preview&&current.job_id===task.id?{...current,previewFailed:true}:current);}
           else {
             if(j.result_id){const r=await api('/reports/'+j.result_id);if(active)setCompletedResult(r);if(active&&r.kind==='news_analysis'){setPage('home');}else if(active){setReport(r);if(r.security_id)setSelected(r.security_id);if(r.kind!=='brief')setPage(r.kind==='portfolio'?'portfolio':'research');}}
             if(active)setNotice((task.completion||'任务已完成并保存。')+' · 100%');
@@ -105,8 +113,12 @@ function App(){
   }
   async function cancelAnalysis(){
     if(!task||task.cancelling)return;
-    const id=task.id;setTask(current=>current?.id===id?{...current,cancelling:true,detail:'正在取消分析…'}:current);
-    try{const result=await api('/jobs/'+id+'/cancel','POST',{});if(!result.accepted)setTask(current=>current?.id===id?{...current,cancelling:false}:current);}
+    const id=task.id;setTask(current=>current?.id===id?{...current,cancelling:true,detail:'正在停止…'}:current);
+    try{
+      const result=await api('/jobs/'+id+'/cancel','POST',{});
+      if(result.accepted){setTask(null);setCompletedResult(null);setReport((current:any)=>(current?.preview&&current.job_id===id)||(result.discarded_report_ids||[]).includes(current?.id)?null:current);setNotice('已取消，本次报告与草稿未保存。');previewSeen.current='';void load().catch(()=>{});}
+      else setTask(current=>current?.id===id?{...current,cancelling:false}:current);
+    }
     catch(e:any){setError(e.message);setTask(current=>current?.id===id?{...current,cancelling:false}:current);}
   }
   function viewCompletedResult(){
@@ -153,7 +165,7 @@ function App(){
       <button className={page==='settings'?'nav active settings-nav':'nav settings-nav'} onClick={()=>navigate('settings')}><Settings2 size={19}/>维护设置</button>
     </aside>
     <main>
-      <FeedbackDock error={error} notice={notice} progress={task?(task.detail||task.label):pending?pending+'…':''} percent={task?.progress??(task?0:undefined)} onCancel={task?cancelAnalysis:undefined} cancelling={!!task?.cancelling} onErrorClose={()=>setError('')} onNoticeClose={()=>{setNotice('');setCompletedResult(null)}} onViewResult={completedResult?viewCompletedResult:undefined} onHeight={setFeedbackHeight}/>
+      <FeedbackDock error={error} notice={notice} progress={task?(task.detail||task.label):pending?pending+'…':''} percent={task?.progress??(task?0:undefined)} onCancel={task?cancelAnalysis:undefined} cancelling={!!task?.cancelling} elapsed={task?.elapsed} completed={task?.completed} total={task?.total} onErrorClose={()=>setError('')} onNoticeClose={()=>{setNotice('');setCompletedResult(null)}} onViewResult={completedResult?viewCompletedResult:undefined} onHeight={setFeedbackHeight}/>
       {feedbackHeight>0&&<div className="feedback-spacer" aria-hidden="true" style={{height:feedbackHeight}}/>}
       <header className="topline"><span>{new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'long',day:'numeric',weekday:'long'}).format(new Date())}</span><span className="local-state"><span/>本机运行</span></header>
       {page==='home'&&<>

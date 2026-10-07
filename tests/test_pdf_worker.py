@@ -45,9 +45,11 @@ def test_historical_financial_timeout_does_not_write_data(monkeypatch,tmp_path):
     from backend.storage import Store
     store=Store(tmp_path)
     def timeout(*args,**kwargs):
-        assert kwargs['timeout']==45
+        assert args[1]==45
         raise subprocess.TimeoutExpired('history',45)
-    monkeypatch.setattr(subprocess,'run',timeout)
+    from unittest.mock import Mock
+    monkeypatch.setattr(subprocess,'Popen',Mock())
+    monkeypatch.setattr('backend.task_io.wait_process',timeout)
     with pytest.raises(ProviderError,match='继续以官方原文研究'):
         collect_financial_history(store,{'id':'HK:00700','ticker':'00700','exchange':'HK'})
     assert not store.rows('SELECT * FROM financial_history')

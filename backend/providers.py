@@ -8,6 +8,7 @@ from decimal import Decimal
 from urllib.parse import urlparse
 import httpx
 from contextlib import contextmanager
+from .task_io import TaskClient, current_control, async_request
 from .domain import dec
 
 
@@ -57,6 +58,7 @@ class Market:
     def __init__(self):
         self.client = httpx.Client(timeout=httpx.Timeout(12, connect=6), follow_redirects=False,
                                    headers={"User-Agent": "Mozilla/5.0 RetirementWealth/0.1"})
+        self.client = TaskClient(self.client)
 
     def lookup(self, text):
         text = text.strip()
@@ -220,15 +222,14 @@ class Kimi:
             client.close()
 
     def post(self, url, control=None, **kwargs):
-        with self.request_client(control) as client:
-            if control:control.check()
-            return client.post(url, **kwargs)
+        if control: return async_request(self.client, "POST", url, control, **kwargs)
+        return self.client.post(url, **kwargs)
 
     def models(self):
         key = self.credentials.get('kimi')
         if not key:raise ProviderError('请先配置 Kimi API 密钥。',unbilled=True)
         try:
-            r=self.client.get('https://api.moonshot.cn/v1/models',headers={'Authorization':'Bearer '+key},timeout=12)
+            r=TaskClient(self.client).get('https://api.moonshot.cn/v1/models',headers={'Authorization':'Bearer '+key},timeout=12)
             r.raise_for_status()
             data=r.json()['data']
             if not isinstance(data,list):raise ValueError('invalid models')
@@ -239,7 +240,7 @@ class Kimi:
     def official_rates(self):
         from .model_profile import parse_official_rates
         try:
-            r=self.client.get('https://platform.kimi.com/docs/pricing/chat.md',timeout=12)
+            r=TaskClient(self.client).get('https://platform.kimi.com/docs/pricing/chat.md',timeout=12)
             r.raise_for_status()
             if len(r.content)>1000000:raise ValueError('rate document too large')
             return parse_official_rates(r.text)
@@ -294,7 +295,7 @@ class Kimi:
 class Push:
     def __init__(self, credentials):
         self.credentials = credentials
-        self.client = httpx.Client(timeout=20, follow_redirects=False)
+        self.client = TaskClient(httpx.Client(timeout=20, follow_redirects=False))
 
     def send(self, title, content):
         key = self.credentials.get("push")

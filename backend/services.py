@@ -3,7 +3,7 @@ import re
 import uuid
 import threading
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from .storage import utcnow
@@ -12,6 +12,7 @@ from .providers import ProviderError, MODEL_MAX_OUTPUT_TOKENS
 from .collection import Collector
 from .signals import disclosure_signal
 from .cancellation import JobCancelled
+from .task_io import set_control, cancellable_lock
 
 
 def beijing_now():
@@ -223,6 +224,7 @@ class Services:
         self.job_controls = {}
         self.controls_lock = threading.Lock()
         self.profile_lock = threading.Lock()
+        self.ai_limit = threading.BoundedSemaphore(2)
         self.stop = threading.Event()
         self.scheduler = None
 
@@ -238,6 +240,10 @@ class Services:
                 "remaining": money(max(Decimal(0), limit-used)), "warning": used >= limit * Decimal("0.8")}
 
     def ai_call(self, messages):
+        with cancellable_lock(self.ai_limit):
+            return self._ai_call(messages)
+
+    def _ai_call(self, messages):
         self.check_cancelled()
         self.sync_model_profile()
         self.check_cancelled()
@@ -294,13 +300,17 @@ class Services:
 
     def collect_financial_history(self,sid):
         from .data_adapters import collect_financial_history
-        cached=self.store.settings().get('financial_history:'+sid)
-        if cached and (beijing_now()-datetime.fromisoformat(cached)).total_seconds()<86400:return
+        from . import performance_cache as cache
+        if cache.get(self.store,'financial-history',sid):return
+        attempted=self.store.settings().get('financial_attempt:'+sid)
+        if attempted and (beijing_now()-datetime.fromisoformat(attempted)).total_seconds()<300:return
         s=self.store.rows('SELECT * FROM securities WHERE id=?',(sid,))[0]
         # Attempt is recorded so a provider outage cannot start endless repeated network calls.
-        self.store.save_settings({'financial_history:'+sid:utcnow()})
+        self.store.save_settings({'financial_attempt:'+sid:utcnow()})
         self.job_progress("正在补充历史财务表（最多45秒，失败后继续其他资料）")
-        collect_financial_history(self.store,s)
+        result=collect_financial_history(self.store,s)
+        self.check_cancelled()
+        if result:cache.put(self.store,'financial-history',sid,True,86400)
 
     def refresh_fx(self, force=False, now=None):
         now = now or datetime.now(timezone.utc)
@@ -375,12 +385,14 @@ class Services:
 
         def run():
             try:
+                set_control(control)
                 self.job_context.id = jid
                 self.job_context.scope = (0, 100)
                 self.job_context.control = control
                 self.store.write_context.control = control
                 with control.lock:
                     control.check()
+                    control.phase_change("processing")
                     self.store.execute("UPDATE jobs SET status='running',message='正在处理，请稍候' WHERE id=?", (jid,))
                 result = func()
                 with control.lock:
@@ -403,12 +415,83 @@ class Services:
                         self.store.execute("UPDATE jobs SET status='failed',message=? WHERE id=?", (message, jid))
                         self.store.event(kind, message)
             finally:
+                control.cleanup_pending=False
+                control.phase_change("cancelled" if control.cancelled.is_set() else "finished")
+                self.store.execute("UPDATE jobs SET metadata=? WHERE id=?",(json.dumps(control.metadata()),jid))
+                self.store.event('timing',json.dumps({'kind':kind,**{k:v for k,v in control.metadata().items() if k not in ('preview_run',)}},ensure_ascii=False))
+                set_control(None)
                 self.job_context.id = None
                 self.job_context.control = None
                 self.store.write_context.control = None
                 with self.controls_lock:self.job_controls.pop(jid, None)
         control.future = self.executor.submit(run)
         return jid
+
+    def parallel(self, items, func, workers=2):
+        context=dict(self.job_context.__dict__)
+        control=context.get('control')
+        def child(item):
+            self.job_context.__dict__.update(context)
+            self.store.write_context.control=control
+            set_control(control)
+            try:
+                self.check_cancelled()
+                return func(item)
+            finally:
+                set_control(None);self.job_context.__dict__.clear();self.store.write_context.control=None
+        with ThreadPoolExecutor(max_workers=workers,thread_name_prefix='research-child') as pool:
+            futures={pool.submit(child,item):index for index,item in enumerate(items)}
+            results=[None]*len(items)
+            for future in as_completed(futures):
+                self.check_cancelled()
+                results[futures[future]]=future.result()
+            return results
+
+    def task_preview_run(self, run):
+        control=getattr(self.job_context,'control',None)
+        jid=getattr(self.job_context,'id',None)
+        if control and jid:
+            with control.lock:
+                control.check();control.preview_run=run
+                self.store.execute('UPDATE jobs SET metadata=? WHERE id=?',(json.dumps(control.metadata()),jid))
+
+    def job_details(self, jid):
+        row=self.store.rows('SELECT * FROM jobs WHERE id=?',(jid,))[0]
+        metadata=json.loads(row.pop('metadata','{}'))
+        with self.controls_lock:control=self.job_controls.get(jid)
+        if control:metadata=control.metadata()
+        row.update(metadata)
+        preview=self.job_preview(jid)
+        if row['status']=='done' and row['result_id']:
+            reports=self.store.rows('SELECT payload FROM reports WHERE id=?',(row['result_id'],))
+            if reports:preview={'payload':json.loads(reports[0]['payload'])}
+        row['completed_sections']=preview.get('payload',{}).get('coverage',{}).get('completed_sections',0)
+        row['total_sections']=preview.get('payload',{}).get('coverage',{}).get('total_sections',0)
+        return row
+
+    def job_preview(self, jid):
+        row=self.store.rows('SELECT * FROM jobs WHERE id=?',(jid,))[0]
+        if row['status'] in ('cancelled','cancelling'):return {'available':False}
+        if row['status']=='done':return {'available':False,'report_id':row['result_id']}
+        run=json.loads(row.get('metadata','{}')).get('preview_run')
+        if not run:return {'available':False}
+        runs=self.store.rows('SELECT * FROM research_runs WHERE id=?',(run,))
+        if not runs:return {'available':False}
+        from .research_engine import SECTIONS
+        chapters={r['section']:r for r in self.store.rows('SELECT * FROM research_sections WHERE run_id=?',(run,))}
+        done=[key for key,_ in SECTIONS if chapters.get(key,{}).get('status')=='done']
+        if not done:return {'available':False}
+        snapshot=json.loads(runs[0]['snapshot']);sid=runs[0]['security_id']
+        security=self.store.rows('SELECT name FROM securities WHERE id=?',(sid,))[0]
+        sections=[{'key':key,'label':label,'status':chapters.get(key,{}).get('status','pending'),
+                   'report':json.loads(chapters[key]['payload']) if key in done else None} for key,label in SECTIONS]
+        # Only validated completed chapters enter preview, never raw streamed tokens.
+        payload={'title':security['name']+' · 系统研究','summary':next(section['report']['summary'] for section in sections if section['report']),
+                 'sections':sections,'as_of':snapshot.get('as_of'),'calculation':snapshot.get('calculation'),
+                 'coverage':{'completed_sections':len(done),'total_sections':len(SECTIONS)}}
+        evidence=self.store.rows("SELECT id,title,url,published_at,verification,locator FROM evidence WHERE security_id=? AND verification!='title_only'",(sid,))
+        return {'available':True,'id':'preview:'+run,'job_id':jid,'preview':True,'security_id':sid,
+                'kind':'research','payload':payload,'evidence':evidence,'created_at':row['created_at']}
 
     def check_cancelled(self):
         control = getattr(self.job_context, 'control', None)
@@ -419,7 +502,7 @@ class Services:
         from .model_profile import select_api_profile, PROFILE
         if not isinstance(self.kimi, Kimi) or not self.credentials.get('kimi'):return
         self.check_cancelled()
-        with self.profile_lock:
+        with cancellable_lock(self.profile_lock):
             cfg=self.store.settings()
             checked=cfg.get('model_sync',{}).get('checked_at')
             if not force and checked:
@@ -463,12 +546,17 @@ class Services:
         with control.lock:
             row = self.store.rows('SELECT status FROM jobs WHERE id=?',(jid,))[0]
             if row['status'] not in ('queued','running','cancelling'):return {'accepted':False}
+            if control.cancel_started is None:control.cancel_started=__import__("time").monotonic()
             control.cancelled.set()
+            control.cleanup_pending=True
+            discarded_reports=sorted(control.reports)
             queued = bool(control.future and control.future.cancel())
             with self.store.connect() as db:
                 control.discard(db)
                 db.execute("UPDATE jobs SET status=?,message=?,result_id=NULL WHERE id=?",
-                           ('cancelled' if queued else 'cancelling', '已取消，本次报告与草稿未保存' if queued else '正在取消：已停止后续步骤，本次报告与草稿不保存',jid))
+                           ('cancelled', '已取消，本次报告与草稿未保存',jid))
+                if queued:control.cleanup_pending=False
+                db.execute('UPDATE jobs SET metadata=? WHERE id=?',(json.dumps(control.metadata()),jid))
             closers = list(control.closers)
         def close_requests():
             for closer in closers:
@@ -477,23 +565,19 @@ class Services:
         threading.Thread(target=close_requests,daemon=True).start()
         if queued:
             with self.controls_lock:self.job_controls.pop(jid,None)
-        return {'accepted':True}
+        return {'accepted':True,'status':'cancelled','cleanup_pending':control.cleanup_pending,'discarded_report_ids':discarded_reports}
 
     def research(self, sid, question, run_id=None):
-        if not self.research_lock.acquire(blocking=False):
-            raise ProviderError("已有深度研究在进行，请等待完成。")
-        try:
+        self.job_progress("正在等待上一任务清理",0)
+        with cancellable_lock(self.research_lock):
             from .research_engine import ResearchEngine
             return ResearchEngine(self).company(sid, question, run_id)
-        finally:
-            self.research_lock.release()
 
     def portfolio_research(self):
-        if not self.research_lock.acquire(blocking=False):raise ProviderError('已有研究正在进行，请等待完成。',unbilled=True)
-        try:
+        self.job_progress('正在等待上一任务清理',0)
+        with cancellable_lock(self.research_lock):
             from .research_engine import ResearchEngine
             return ResearchEngine(self).portfolio()
-        finally:self.research_lock.release()
 
     def _research(self, sid, question):
         securities = self.store.rows("SELECT * FROM securities WHERE id=?", (sid,))
@@ -656,6 +740,7 @@ class Services:
         return "\n\n[资料节选，可能不完整]\n".join(parts)[:4000]
 
     def collection_progress(self, sid, message, percent=None):
+        self.check_cancelled()
         self.store.save_settings({'collection:'+sid: {'status':'running','checked_at':utcnow(),'message':message}})
         self.job_progress(message, percent)
 
@@ -663,6 +748,11 @@ class Services:
         self.check_cancelled()
         jid = getattr(self.job_context, 'id', None)
         if jid:
+            control=getattr(self.job_context,'control',None)
+            if control:
+                phase='model' if 'AI' in message else 'search' if '搜索' in message or '联网' in message else 'parse' if '读取原文' in message else 'collect' if '资料' in message or '财务' in message else 'save' if '保存' in message else 'processing'
+                control.phase_change(phase)
+                self.store.execute('UPDATE jobs SET metadata=? WHERE id=?',(json.dumps(control.metadata()),jid))
             if percent is None:
                 self.store.execute("UPDATE jobs SET message=? WHERE id=? AND status='running'", (message,jid))
             else:
@@ -680,75 +770,95 @@ class Services:
 
     def collect_company(self,sid,quote=True):
         lock=self.collection_locks.setdefault(sid,threading.Lock())
-        with lock:
-            rows=self.store.rows("SELECT * FROM securities WHERE id=?",(sid,))
-            if not rows:raise ProviderError("公司不存在。")
-            s=rows[0];failures=[];downloaded=0
-            self.store.save_settings({"collection:"+sid:{"status":"running","checked_at":utcnow(),"message":"正在自动查找财报和公告"}})
-            self.collection_progress(sid,"正在更新行情",5)
-            if quote:
-                try:
-                    q=self.market.quote(s)
-                    from .data_adapters import save_quote
-                    save_quote(self.store,sid,q)
-                except Exception:failures.append("行情未更新")
+        with cancellable_lock(lock):
+            try:return self._collect_company(sid,quote)
+            except JobCancelled:
+                self.store.save_settings({'collection:'+sid:{'status':'cancelled','checked_at':utcnow(),'message':'本次收集已取消，已有资料保留。'}})
+                raise
+
+    def _collect_company(self,sid,quote=True):
+        rows=self.store.rows("SELECT * FROM securities WHERE id=?",(sid,))
+        if not rows:raise ProviderError("公司不存在。")
+        s=rows[0];failures=[];downloaded=0
+        self.store.save_settings({"collection:"+sid:{"status":"running","checked_at":utcnow(),"message":"正在自动查找财报和公告"}})
+        self.collection_progress(sid,"正在更新行情",5)
+        if quote:
             try:
-                self.collection_progress(sid,"正在查询交易所公告与财报目录",10)
+                q=self.market.quote(s)
+                from .data_adapters import save_quote
+                save_quote(self.store,sid,q)
+            except Exception:failures.append("行情未更新")
+        try:
+            self.collection_progress(sid,"正在查询交易所公告与财报目录",10)
+            from . import performance_cache as cache
+            documents=cache.get(self.store,'documents',sid)
+            if documents is None:
                 documents=self.collector.documents(s)
-                for index,e in enumerate(documents):
-                    previous=self.store.rows("SELECT * FROM evidence WHERE security_id=? AND url=? AND title=?",(sid,e["url"],e["title"]))
-                    if previous and previous[0]["verification"]=="official_download":
-                        from .research_engine import needs_pdf_repair
-                        if not needs_pdf_repair(previous[0]["content"]):continue
-                    if index>=6:
-                        self.store.execute("INSERT OR IGNORE INTO evidence(security_id,title,url,published_at,content,kind,verification,fetched_at)"
-                            " VALUES(?,?,?,?,?,?,?,?)",(sid,e['title'],e['url'],e['published_at'],e['title'],e['kind'],'title_only',utcnow()))
-                        continue
-                    try:
-                        self.collection_progress(sid,f"读取原文 {index+1}/{min(6,len(documents))}：{e['title']}（单份解析最多60秒）",15+60*index/max(1,min(6,len(documents))))
-                        content=self.market.official_text(e["url"])
-                        values=(sid,e["title"],e["url"],e["published_at"],content,e["kind"],"official_download",utcnow(),
-                                "官方PDF自动读取；按页保存，部分页可能使用备用解析/OCR")
-                        if previous:
-                            self.store.execute("UPDATE evidence SET content=?,verification='official_download',locator=?,fetched_at=? WHERE id=?",
-                                (content,values[-1],utcnow(),previous[0]["id"]))
-                        else:
-                            self.store.execute("INSERT INTO evidence(security_id,title,url,published_at,content,kind,verification,fetched_at,locator)"
-                                               " VALUES(?,?,?,?,?,?,?,?,?)",values)
-                        downloaded+=1
-                    except Exception as exc:
-                        failures.append(e["title"]+"："+(str(exc) if isinstance(exc,ProviderError) else "原文读取失败"))
-                        self.store.execute("INSERT OR IGNORE INTO evidence(security_id,title,url,published_at,content,kind,verification,fetched_at)"
-                                           " VALUES(?,?,?,?,?,?,?,?)",(sid,e["title"],e["url"],e["published_at"],e["title"],e["kind"],"title_only",utcnow()))
-            except Exception as exc:
-                failures.append(str(exc) if isinstance(exc,ProviderError) else "官方财报与公告查询未完成")
-            try:
-                self.collection_progress(sid,"正在查询结构化财务数据",80)
-                f=self.collector.financials(s)
-                content=json.dumps(f,ensure_ascii=False)
-                previous=self.store.rows("SELECT id FROM evidence WHERE security_id=? AND verification='aggregated' AND content=?",(sid,content))
-                eid=previous[0]["id"] if previous else self.store.execute(
-                    "INSERT INTO evidence(security_id,title,url,published_at,report_period,locator,content,kind,verification,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (sid,f["report_period"]+"财务指标 · 采集 "+utcnow(),f["url"],f.get("publication") or str(beijing_now().date()),
-                     f["report_period"],f["locator"]+"；无发布日期时此日期为采集日",content,"financial","aggregated",utcnow()))
-                # Manual overrides survive; automatic snapshots update without altering old reports.
-                old=self.store.rows("SELECT v.*,e.verification FROM valuation_inputs v JOIN evidence e ON e.id=v.evidence_id WHERE v.security_id=?",(sid,))
-                if not old or (old[0]["verification"]=="aggregated" and f["as_of"]>=old[0]["as_of"]):
-                    self.store.execute("INSERT OR REPLACE INTO valuation_inputs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (sid,eid,f["currency"],f["earnings_basis"],f["report_period"],f["as_of"],f["eps"],f["book_per_share"],
-                         f["dividend_per_share"],f["locator"],utcnow()))
-            except Exception as exc:
-                failures.append(str(exc) if isinstance(exc,ProviderError) else "自动财务指标未更新")
-            if s["exchange"]=="HK":
-                try:self.refresh_fx()
-                except ProviderError:failures.append('汇率未更新')
-            count=self.store.rows("SELECT COUNT(*) AS n FROM evidence WHERE security_id=? AND verification='official_download'",(sid,))[0]["n"]
-            message=f"已保存 {count} 份官方原文；本次新增 {downloaded} 份"
-            if failures:message+="。部分资料未获取："+ "；".join(failures)
-            result={"status":"partial" if failures else "done","checked_at":utcnow(),"message":message,"failures":failures}
-            self.store.save_settings({"collection:"+sid:result})
-            self.store.event("collection",s["name"]+"："+message)
-            return result
+                self.check_cancelled()
+                for document in documents:document['url']=cache.canonical_url(document['url'])
+                cache.put(self.store,'documents',sid,documents,1800)
+            def read_document(item):
+                index,e=item
+                self.check_cancelled()
+                previous=self.store.rows("SELECT * FROM evidence WHERE security_id=? AND url=? AND title=?",(sid,e["url"],e["title"]))
+                if previous and previous[0]["verification"]=="official_download":
+                    from .research_engine import needs_pdf_repair
+                    if (previous[0]['published_at']==e['published_at'] and not needs_pdf_repair(previous[0]["content"]) and cache.get(self.store,'document-source',cache.source_identity(sid,e))):return 0
+                if index>=6:
+                    self.store.execute("INSERT OR IGNORE INTO evidence(security_id,title,url,published_at,content,kind,verification,fetched_at)"
+                        " VALUES(?,?,?,?,?,?,?,?)",(sid,e['title'],e['url'],e['published_at'],e['title'],e['kind'],'title_only',utcnow()))
+                    return 0
+                try:
+                    self.collection_progress(sid,f"读取原文 {index+1}/{min(6,len(documents))}：{e['title']}（单份解析最多60秒）",15+60*index/max(1,min(6,len(documents))))
+                    content=self.market.official_text(e["url"])
+                    values=(sid,e["title"],e["url"],e["published_at"],content,e["kind"],"official_download",utcnow(),
+                            "官方PDF自动读取；按页保存，部分页可能使用备用解析/OCR")
+                    if previous:
+                        self.store.execute("UPDATE evidence SET content=?,verification='official_download',locator=?,fetched_at=? WHERE id=?",
+                            (content,values[-1],utcnow(),previous[0]["id"]))
+                    else:
+                        self.store.execute("INSERT INTO evidence(security_id,title,url,published_at,content,kind,verification,fetched_at,locator)"
+                                           " VALUES(?,?,?,?,?,?,?,?,?)",values)
+                    if '[此页文字不可读' not in content:cache.put(self.store,'document-source',cache.source_identity(sid,e),True,604800)
+                    if e['kind']=='financial':
+                        self.store.execute('DELETE FROM performance_cache WHERE cache_key=?',(cache.key('financial-history',sid),))
+                        self.store.save_settings({'financial_attempt:'+sid:None})
+                    return 1
+                except Exception as exc:
+                    failures.append(e["title"]+"："+(str(exc) if isinstance(exc,ProviderError) else "原文读取失败"))
+                    self.store.execute("INSERT OR IGNORE INTO evidence(security_id,title,url,published_at,content,kind,verification,fetched_at)"
+                                       " VALUES(?,?,?,?,?,?,?,?)",(sid,e["title"],e["url"],e["published_at"],e["title"],e["kind"],"title_only",utcnow()))
+                return 0
+            downloaded=sum(self.parallel(list(enumerate(documents)),read_document))
+        except Exception as exc:
+            failures.append(str(exc) if isinstance(exc,ProviderError) else "官方财报与公告查询未完成")
+        try:
+            self.collection_progress(sid,"正在查询结构化财务数据",80)
+            f=self.collector.financials(s)
+            content=json.dumps(f,ensure_ascii=False)
+            previous=self.store.rows("SELECT id FROM evidence WHERE security_id=? AND verification='aggregated' AND content=?",(sid,content))
+            eid=previous[0]["id"] if previous else self.store.execute(
+                "INSERT INTO evidence(security_id,title,url,published_at,report_period,locator,content,kind,verification,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (sid,f["report_period"]+"财务指标 · 采集 "+utcnow(),f["url"],f.get("publication") or str(beijing_now().date()),
+                 f["report_period"],f["locator"]+"；无发布日期时此日期为采集日",content,"financial","aggregated",utcnow()))
+            # Manual overrides survive; automatic snapshots update without altering old reports.
+            old=self.store.rows("SELECT v.*,e.verification FROM valuation_inputs v JOIN evidence e ON e.id=v.evidence_id WHERE v.security_id=?",(sid,))
+            if not old or (old[0]["verification"]=="aggregated" and f["as_of"]>=old[0]["as_of"]):
+                self.store.execute("INSERT OR REPLACE INTO valuation_inputs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (sid,eid,f["currency"],f["earnings_basis"],f["report_period"],f["as_of"],f["eps"],f["book_per_share"],
+                     f["dividend_per_share"],f["locator"],utcnow()))
+        except Exception as exc:
+            failures.append(str(exc) if isinstance(exc,ProviderError) else "自动财务指标未更新")
+        if s["exchange"]=="HK":
+            try:self.refresh_fx()
+            except ProviderError:failures.append('汇率未更新')
+        count=self.store.rows("SELECT COUNT(*) AS n FROM evidence WHERE security_id=? AND verification='official_download'",(sid,))[0]["n"]
+        message=f"已保存 {count} 份官方原文；本次新增 {downloaded} 份"
+        if failures:message+="。部分资料未获取："+ "；".join(failures)
+        result={"status":"partial" if failures else "done","checked_at":utcnow(),"message":message,"failures":failures}
+        self.store.save_settings({"collection:"+sid:result})
+        self.store.event("collection",s["name"]+"："+message)
+        return result
 
     def alerts(self):
         from .accounting import overview

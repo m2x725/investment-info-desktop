@@ -133,13 +133,16 @@ def test_garbled_source_excluded_and_historical_chunks_retained(svc):
 
 def test_chapter_checkpoints_resume_without_recharging_completed(svc):
     sid=add(svc);eid=evidence(svc,sid)
-    svc.ai_call=Mock(side_effect=[report(eid),ProviderError('mock timeout')])
+    def complete(messages):
+        if json.loads(messages[1]['content'])['chapter']==SECTIONS[1][1]:raise ProviderError('mock timeout')
+        return report(eid)
+    svc.ai_call=Mock(side_effect=complete)
     engine=ResearchEngine(svc);rid=engine.company(sid,'完整研究')
     payload=json.loads(svc.store.rows('SELECT payload FROM reports WHERE id=?',(rid,))[0]['payload'])
-    run=payload['run_id'];assert payload['coverage']['completed_sections']==1
+    run=payload['run_id'];assert payload['coverage']['completed_sections']==4
     svc.ai_call=Mock(return_value=report(eid));rid2=engine.company(sid,'完整研究',run)
     resumed=json.loads(svc.store.rows('SELECT payload FROM reports WHERE id=?',(rid2,))[0]['payload'])
-    assert svc.ai_call.call_count==4 # completed and uncertain chapters are not blindly retried
+    assert svc.ai_call.call_count==0 # all completed/uncertain calls are preserved; countercase waits for complete coverage
     assert resumed['sections'][1]['status']=='uncertain' and resumed['as_of']==payload['as_of']
 
 def test_partial_output_continues_and_keeps_original(svc):
@@ -264,12 +267,15 @@ def test_valid_unicode_garbled_cid_maps_rejected_but_good_pages_kept(svc):
 
 def test_budget_stop_is_resumable_not_mistaken_for_paid_timeout(svc):
     sid=add(svc);eid=evidence(svc,sid)
-    svc.ai_call=Mock(side_effect=[report(eid),ProviderError('预算不足',unbilled=True)])
+    def complete(messages):
+        if json.loads(messages[1]['content'])['chapter']==SECTIONS[1][1]:raise ProviderError('预算不足',unbilled=True)
+        return report(eid)
+    svc.ai_call=Mock(side_effect=complete)
     engine=ResearchEngine(svc);rid=engine.company(sid,'研究')
     first=json.loads(svc.store.rows('SELECT payload FROM reports WHERE id=?',(rid,))[0]['payload'])
     assert first['sections'][1]['status']=='pending'
     svc.ai_call=Mock(return_value=report(eid));engine.company(sid,'研究',first['run_id'])
-    assert svc.ai_call.call_count==5
+    assert svc.ai_call.call_count==2 # only unfinished financial and dependent countercase
 
 
 def test_old_pdf_cover_does_not_hide_corrupt_body_or_repeat_processed_ocr():
@@ -286,7 +292,8 @@ def test_search_limits_history_dates_and_excerpt_fallback(svc):
     svc.store.execute('INSERT INTO research_runs VALUES(?,?,?,?,?,?,?)',('search-test',sid,'company',json.dumps({'as_of':utcnow()}),'running',utcnow(),None))
     engine=ResearchEngine(svc);engine.retrieve(s,'search-test')
     calls=svc.kimi.tool.call_args_list
-    assert len(calls)==12 and '2025' in calls[0].args[1]['text_query']
+    assert len(calls)==12 and any('2025' in call.args[1]['text_query'] for call in calls)
+    assert all('time_window' not in call.args[1] for call in calls if '年报 年度业绩' in call.args[1]['text_query'])
     assert 'time_window' not in calls[-1].args[1] # historical gap search must not be limited to the latest90days
     svc.kimi.tool=Mock(return_value={'search_results':[dict(title='测试公司 最新公告',url='https://example.com/latest',snippet='测试公司新增业务资料，收入情况待核对。',chunks=[])]})
     svc.store.execute('INSERT INTO research_runs VALUES(?,?,?,?,?,?,?)',('excerpt-test',sid,'retrieval',json.dumps({'as_of':utcnow()}),'running',utcnow(),None))

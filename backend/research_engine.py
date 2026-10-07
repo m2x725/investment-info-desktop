@@ -7,6 +7,7 @@ from .providers import ProviderError
 from .cancellation import JobCancelled
 from .storage import utcnow
 from .accounting import overview,risk_analysis
+from . import performance_cache as cache
 
 TEMPLATE_VERSION='hk-connect-2026.10-v1'
 SECTIONS=[('business','业务与盈利来源'),('financial','历史财务、现金流与资本分配'),('events','最新经营、政策与重大事件'),('competition','行业与同业竞争'),('valuation','估值、预期与情景'),('countercase','反方证据、论点失效条件与观察指标')]
@@ -41,13 +42,17 @@ def public_url(url):
     except ValueError:return False
 
 def index_source(store,e):
-    text=e['content'];quality='readable' if readable(text) else 'unreadable'
+    text=e['content']
+    digest=hashlib.sha256(text.encode()).hexdigest()
+    if cache.get(store,'chunks',[e['id'],digest]):return 'readable' if readable(text) else 'unreadable'
+    quality='readable' if readable(text) else 'unreadable'
     # Source boundaries retained. Chunking controls context, not saved/report length.
     chunks=re.split(r'(?=\[第\d+页\])|\n(?=#{1,4} )',text)
     parts=[c[start:start+3500] for c in chunks for start in range(0,len(c),3000) if c[start:start+3500].strip()]
     with store.connect() as db:
         db.execute('DELETE FROM source_chunks WHERE evidence_id=?',(e['id'],))
         for n,c in enumerate(parts):db.execute('INSERT INTO source_chunks VALUES(?,?,?,?)',(e['id'],n,c,'readable' if readable(c) else 'unreadable'))
+    cache.put(store,'chunks',[e['id'],digest],True,604800)
     return quality
 
 def material_pack(store,evidence,topic,byte_limit=65000):
@@ -81,12 +86,19 @@ def context_text(text,limit=5000):
 class ResearchEngine:
     def __init__(self,services):
         self.svc=services;self.store=services.store;self.searches=0;self.fetches=0
+        self.retrieval_lock=__import__("threading").Lock()
 
-    def tool(self,name,payload):
+    def tool(self,name,payload,identity=None,ttl=None):
+        from .task_io import cancellable_lock
+        with cancellable_lock(self.svc.ai_limit):
+            return self._tool(name,payload,identity,ttl)
+
+    def _tool(self,name,payload,identity=None,ttl=None):
         self.svc.check_cancelled()
-        cache_key=hashlib.sha256(json.dumps([name,payload],sort_keys=True).encode()).hexdigest()
-        cached=self.store.rows('SELECT * FROM tool_cache WHERE cache_key=?',(cache_key,))
-        if cached and datetime.now(timezone.utc)-datetime.fromisoformat(cached[0]['created_at'])<timedelta(hours=6):return json.loads(cached[0]['payload'])
+        cache_ttl=ttl or (604800 if name=='fetch' else 1800)
+        cache_identity=[TEMPLATE_VERSION,identity,name,payload,cache_ttl]
+        cached=cache.get(self.store,'tool',cache_identity)
+        if cached is not None:return cached
         settings=self.store.settings()
         if not settings.get('prices_confirmed') or not self.svc.credentials.get('kimi'):raise ProviderError('联网研究需要已配置的Kimi密钥和费用设置。')
         fee=dec('.015' if name=='search_pro' else '.01')
@@ -98,7 +110,7 @@ class ResearchEngine:
             billed=bool(result.get('search_results')) if name=='search_pro' else bool(result.get('markdown','').strip())
             self.store.execute("UPDATE expenses SET status='charged',amount=? WHERE id=?",(str(fee if billed else 0),eid))
             self.svc.check_cancelled()
-            self.store.execute('INSERT OR REPLACE INTO tool_cache VALUES(?,?,?)',(cache_key,json.dumps(result,ensure_ascii=False),utcnow()))
+            if billed:cache.put(self.store,'tool',cache_identity,result,cache_ttl)
             return result
         except JobCancelled:
             self.store.execute("UPDATE expenses SET status='charged',amount='0' WHERE id=? AND status='reserved'",(eid,))
@@ -115,23 +127,28 @@ class ResearchEngine:
         queries=[f'{name} {code} {year-1-i} 年报 年度业绩 分部 收入 现金流' for i in range(3)]
         queries += [f'{name} {code} {label}' for _,label in SECTIONS]
         if latest_only:queries=[f'{name} {code} 最新公告 经营变化 财报 政策 风险']
-        for n,query in enumerate(queries):
+        def retrieve_query(item):
+            nonlocal searches,fetches
+            n,query=item
+            self.svc.check_cancelled()
             checkpoint=self.store.rows('SELECT status,payload FROM research_sections WHERE run_id=? AND section=?',(run,'search:'+str(n)))
             if checkpoint:
                 if checkpoint[0]['status']=='uncertain':warnings.append('上一轮搜索结果不明，本次未重复付费。')
-                continue
-            if self.searches>=12:
-                warnings.append('本次研究已达到12次搜索上限，其他缺口保留。');break
-            self.searches+=1;searches+=1
+                return
+            with self.retrieval_lock:
+                if self.searches>=12:
+                    warnings.append('本次研究已达到12次搜索上限，其他缺口保留。');return
+                self.searches+=1;searches+=1
             self.store.execute('INSERT OR REPLACE INTO research_sections VALUES(?,?,?,?)',(run,'search:'+str(n),'{}','uncertain'))
             try:
                 request={'text_query':query,'limit':5}
                 if latest_only or 5<=n<=8:request['time_window']={'start':(datetime.now(timezone.utc)-timedelta(days=90)).date().isoformat(),'end':datetime.now(timezone.utc).date().isoformat()}
-                result=self.tool('search_pro',request)
+                result=self.tool('search_pro',request,identity=s['id'],ttl=604800 if n<3 and not latest_only else 1800)
                 self.store.execute("UPDATE research_sections SET payload=?,status='done' WHERE run_id=? AND section=?",(json.dumps(result,ensure_ascii=False),run,'search:'+str(n)))
                 for source in result.get('search_results',[]):
                     url=source.get('url','')
                     if not public_url(url):continue
+                    url=cache.canonical_url(url)
                     title=source.get('title','');snippet=source.get('snippet','')
                     # Different-company leads do not enter evidence; company identity is still checked in report review.
                     company_match=name in title+snippet or code in title+snippet
@@ -140,10 +157,12 @@ class ResearchEngine:
                     if context:title='[行业/同业背景] '+title
                     content='\n'.join(c.get('text','') for c in source.get('chunks',[])) or snippet
                     verification='context_excerpt' if context else 'search_excerpt'
-                    if self.fetches<8:
-                        self.fetches+=1;fetches+=1
+                    with self.retrieval_lock:
+                        fetch_allowed=self.fetches<8
+                        if fetch_allowed:self.fetches+=1;fetches+=1
+                    if fetch_allowed:
                         try:
-                            fetched=self.tool('fetch',{'url':url}).get('markdown')
+                            fetched=self.tool('fetch',{'url':url},identity=s['id'],ttl=1800 if latest_only or n>=3 else 604800).get('markdown')
                             if fetched:content=fetched;verification='context_retrieved' if context else 'web_retrieved'
                         except Exception:warnings.append('部分正文抓取未完成，保留搜索片段并标注来源。')
                     if not readable(content):warnings.append(title+'：正文不可读');continue
@@ -151,16 +170,18 @@ class ResearchEngine:
                     publication=date_value[:10] if re.match(r'^\d{4}-\d{2}-\d{2}',date_value) else ''
                     self.store.execute('INSERT INTO evidence(security_id,title,url,published_at,content,kind,verification,fetched_at,locator) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(security_id,url,title) DO UPDATE SET content=excluded.content,verification=excluded.verification,published_at=excluded.published_at,fetched_at=excluded.fetched_at',
                         (s['id'],title or '联网研究资料',url,publication,content,'financial' if n<3 and not latest_only else 'news',verification,utcnow(),'搜索日期未确认' if not publication else '网页正文；身份与口径需复核'))
-                if n==8 and not latest_only:
-                    saved=self.store.rows("SELECT content,title,report_period FROM evidence WHERE security_id=? AND verification!='title_only'",(s['id'],))
-                    body='\n'.join(e['content'] for e in saved if readable(e['content']))
-                    gaps=[label for key,label in SECTIONS if not re.search(KEYWORDS[key],body,re.I)]
-                    for old_year in (year-1,year-2,year-3):
-                        if not any(str(old_year) in e['title']+e.get('report_period','') for e in saved):gaps.insert(0,str(old_year)+' 年度财务及官方业绩材料')
-                    queries.extend(f'{name} {code} 官方原文 补充 {gap}' for gap in gaps[:3])
             except Exception as exc:
                 warnings.append(str(exc) if isinstance(exc,ProviderError) else '联网检索未完成')
-                break # no repeated charged failure
+                return # no repeated charged failure
+        self.svc.parallel(list(enumerate(queries)),retrieve_query)
+        if not latest_only:
+            saved=self.store.rows("SELECT content,title,report_period FROM evidence WHERE security_id=? AND verification!='title_only'",(s['id'],))
+            body='\n'.join(e['content'] for e in saved if readable(e['content']))
+            gaps=[label for key,label in SECTIONS if not re.search(KEYWORDS[key],body,re.I)]
+            for old_year in (year-1,year-2,year-3):
+                if not any(str(old_year) in e['title']+e.get('report_period','') for e in saved):gaps.insert(0,str(old_year)+' 年度财务及官方业绩材料')
+            extra=[f'{name} {code} 官方原文 补充 {gap}' for gap in gaps[:3]]
+            self.svc.parallel([(len(queries)+index,query) for index,query in enumerate(extra)],retrieve_query)
         runrow=self.store.rows('SELECT snapshot FROM research_runs WHERE id=?',(run,))[0]
         snap=json.loads(runrow['snapshot']);snap['retrieval']={'searches':searches,'fetches':fetches,'warnings':warnings}
         self.store.execute('UPDATE research_runs SET snapshot=? WHERE id=?',(json.dumps(snap,ensure_ascii=False),run))
@@ -179,6 +200,7 @@ class ResearchEngine:
         else:
             run=uuid.uuid4().hex
             self.store.execute('INSERT INTO research_runs VALUES(?,?,?,?,?,?,?)',(run,sid,'company',json.dumps({'as_of':utcnow(),'question':question},ensure_ascii=False),'running',utcnow(),None))
+        self.svc.task_preview_run(run)
         from .services import SYSTEM
         warnings=[]
         try:
@@ -207,12 +229,14 @@ class ResearchEngine:
         if 'calculation' not in run_snapshot:
             run_snapshot['calculation']=calculation
             self.store.execute('UPDATE research_runs SET snapshot=? WHERE id=?',(json.dumps(run_snapshot,ensure_ascii=False),run))
-        for index,(key,label) in enumerate(SECTIONS):
-            self.svc.job_progress(f"AI正在分析：{label}（{index+1}/{len(SECTIONS)}）",50+40*index/len(SECTIONS))
+        def generate(item):
+            index,(key,label)=item
+            completed=len(self.store.rows("SELECT section FROM research_sections WHERE run_id=? AND status='done' AND section NOT LIKE 'search:%'",(run,)))
+            self.svc.job_progress(f"AI正在分析：{label}",50+40*completed/len(SECTIONS))
             previous=self.store.rows('SELECT * FROM research_sections WHERE run_id=? AND section=?',(run,key))
-            if previous and previous[0]['status']=='done':sections.append({'key':key,'label':label,'status':'done','report':json.loads(previous[0]['payload'])});continue
+            if previous and previous[0]['status']=='done':return {'key':key,'label':label,'status':'done','report':json.loads(previous[0]['payload'])}
             if previous and previous[0]['status']=='uncertain':
-                sections.append({'key':key,'label':label,'status':'uncertain','report':{'summary':'上次调用结果不明，本次未重复调用；请先核对平台账单，确需重做时发起新研究。'}});continue
+                return {'key':key,'label':label,'status':'uncertain','report':{'summary':'上次调用结果不明，本次未重复调用；请先核对平台账单，确需重做时发起新研究。'}}
             materials=material_pack(self.store,good,key)
             continuation=json.loads(previous[0]['payload']) if previous and previous[0]['status']=='partial' else None
             self.store.execute('INSERT OR REPLACE INTO research_sections VALUES(?,?,?,?)',(run,key,'{}','uncertain'))
@@ -227,15 +251,23 @@ class ResearchEngine:
                 self.store.execute("UPDATE research_sections SET payload=?,status='done' WHERE run_id=? AND section=?",(json.dumps(checked,ensure_ascii=False),run,key))
                 if checked['partial_output']:
                     self.store.execute("UPDATE research_sections SET status='partial' WHERE run_id=? AND section=?",(run,key))
-                    sections.append({'key':key,'label':label,'status':'partial','report':checked})
-                    break
-                sections.append({'key':key,'label':label,'status':'done','report':checked})
+                    return {'key':key,'label':label,'status':'partial','report':checked}
+                control=getattr(self.svc.job_context,'control',None)
+                if control:
+                    with control.lock:
+                        if 'first_result' not in control.timings:control.timings['first_result']=round(__import__('time').monotonic()-control.started,3)
+                return {'key':key,'label':label,'status':'done','report':checked}
             except Exception as exc:
                 status='pending' if getattr(exc,'unbilled',False) else 'uncertain'
                 self.store.execute('UPDATE research_sections SET status=? WHERE run_id=? AND section=?',(status,run,key))
-                sections.append({'key':key,'label':label,'status':status,'report':{'summary':str(exc) if isinstance(exc,ProviderError) else '本章节未完成；已有内容保留。'}})
                 warnings.append('部分章节未完成；可查看已生成内容和断点。')
-                break
+                return {'key':key,'label':label,'status':status,'report':{'summary':str(exc) if isinstance(exc,ProviderError) else '本章节未完成；已有内容保留。'}}
+        sections=self.svc.parallel(list(enumerate(SECTIONS[:-1])),generate)
+        self.svc.check_cancelled()
+        if all(section['status']=='done' for section in sections):
+            sections.append(generate((len(SECTIONS)-1,SECTIONS[-1])))
+        else:
+            sections.append({'key':'countercase','label':SECTIONS[-1][1],'status':'pending','report':{'summary':'等待其他章节完成后进行反方审查。'}})
         done=[s for s in sections if s['status'] in ('done','partial')]
         if not done:
             self.store.execute("UPDATE research_runs SET status='partial' WHERE id=?",(run,))

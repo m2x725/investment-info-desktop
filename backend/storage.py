@@ -108,6 +108,8 @@ class Store:
 
         from .upgrade_schema import migrate
         migrate(self)
+        from .performance_cache import migrate_performance
+        migrate_performance(self)
 
     @contextmanager
     def connect(self):

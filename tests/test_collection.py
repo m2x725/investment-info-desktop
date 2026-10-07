@@ -59,6 +59,7 @@ def test_automatic_collection_preserves_cache_and_marks_failed_body(tmp_path):
     assert len(s.store.rows("SELECT * FROM evidence"))==2
     s.collector.documents.return_value.append(dict(title="新公告",url="https://static.cninfo.com.cn/finalpage/2026-04-01/2.PDF",
             published_at="2026-04-01",kind="announcement"))
+    s.store.execute("DELETE FROM performance_cache WHERE kind='documents'") # simulate expired directory
     s.market.official_text.side_effect=ProviderError("timeout")
     assert s.collect_company(sid)["status"]=="partial"
     rows=s.store.rows("SELECT * FROM evidence WHERE title='新公告'")

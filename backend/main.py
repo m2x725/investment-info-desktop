@@ -295,7 +295,12 @@ def create_app(data_dir=None, scheduler=True):
         rows = store.rows("SELECT * FROM jobs WHERE id=?", (jid,))
         if not rows:
             raise HTTPException(404, "任务不存在")
-        return rows[0]
+        return services.job_details(jid)
+
+    @app.get("/api/jobs/{jid}/preview")
+    def job_preview(jid: str):
+        if not store.rows("SELECT id FROM jobs WHERE id=?",(jid,)):raise HTTPException(404,"任务不存在")
+        return services.job_preview(jid)
 
     @app.post("/api/brief")
     def brief(body: dict):

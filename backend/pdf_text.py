@@ -3,6 +3,11 @@ import io
 from .research_engine import readable
 
 def extract(blob, timeout=60):
+    from .task_io import PDF_LIMIT, cancellable_lock
+    with cancellable_lock(PDF_LIMIT):
+        return _worker_extract(blob, timeout)
+
+def _worker_extract(blob, timeout=60):
     """A stalled native parser is killed rather than occupying the job pool forever."""
     import os
     import subprocess
@@ -22,7 +27,8 @@ def extract(blob, timeout=60):
         with subprocess.Popen(command + [str(source), str(output)], env=env,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **options) as process:
             try:
-                process.wait(timeout=timeout)
+                from .task_io import wait_process
+                wait_process(process, timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 process.kill()
