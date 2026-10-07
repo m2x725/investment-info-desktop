@@ -66,6 +66,7 @@ def _launch(headless=False, port=8765):
         start_window(server, app, f"http://127.0.0.1:{port}", profile,
                      windows=sys.platform == "win32")
     finally:
+        app.state.services.request_stop()
         server.should_exit = True
         thread.join(timeout=20)
 
