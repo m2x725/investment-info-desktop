@@ -29,6 +29,7 @@ Name: "autostart"; Description: "登录电脑后自动运行"; Flags: unchecked
 Source: "..\dist\RetirementWealth\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\dist\third-party-notices\*"; DestDir: "{app}\third-party-notices"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\docs\OPEN_SOURCE_REVIEW.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\scripts\Restore-Backup.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\docs\WINDOWS_INSTALL.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\prerequisites\MicrosoftEdgeWebview2Setup.exe"; Flags: dontcopy
 [Icons]
