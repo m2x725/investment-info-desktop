@@ -12,13 +12,13 @@ export function ReportReader({report,onClose,onFollowup,disabled,amount}:any){
  const [drop,setDrop]=useState(10),[fxDrop,setFxDrop]=useState(0);
  const loss=scenarioLoss(p.snapshot,drop,fxDrop);
  const active=sections.find((s:any)=>s.key===tab),body=active?.report;
- const summary=sections.length?(sections.find((s:any)=>s.report?.summary)?.report?.summary||p.summary):p.summary;
+ const summary=sections.length?(sections.find((s:any)=>s.key==='events'&&s.status==='done')?.report?.summary||sections.find((s:any)=>s.status==='done')?.report?.summary||p.summary):p.summary;
  const sentences=String(summary||'').match(/[^。！？]+[。！？]?/g)||[];
  const lead=sentences.slice(0,2).join(''),rest=sentences.slice(2).join('');
  const chapterLabels:Record<string,string>={business:'业务与盈利',financial:'历史财务',events:'最新变化',competition:'行业与同业',valuation:'估值与情景',countercase:'反方与风险'};
- const highlights=[['重点',p.support?.[0]],['风险',p.risks?.[0]],['待核实',p.unknowns?.[0]]].filter(([,v])=>v);
+ const highlights=[['重点',sections.find((s:any)=>s.key==='events'&&s.status==='done')?.report?.support?.[0]||p.support?.[0]],['风险',sections.find((s:any)=>s.key==='countercase'&&s.status==='done')?.report?.risks?.[0]||p.risks?.[0]],['待核实',p.unknowns?.[0]]].filter(([,v])=>v);
  return <section className="report-reader reading-paper" data-result-id={'report:'+report.id} ref={ref} tabIndex={-1} aria-label="研究报告">
-  <div className="reader-top"><span><Check size={16}/>{report.preview?(report.previewFailed?'分析未完成 · 已保留 ':'分析中 · 已完成 ')+p.coverage?.completed_sections+'/'+p.coverage?.total_sections:'已保存'}</span><button className="icon-button" aria-label="关闭报告" onClick={onClose}><X size={19}/></button></div>
+  <div className="reader-top"><span><Check size={16}/>{report.preview?(report.previewFailed?'分析未完成 · 已保留 ':'分析中 · 已完成 ')+p.coverage?.completed_sections+'/'+p.coverage?.total_sections:(p.coverage?.total_sections&&p.coverage.completed_sections<p.coverage.total_sections?'部分完成 · 已保存':'已保存')}</span><button className="icon-button" aria-label="关闭报告" onClick={onClose}><X size={19}/></button></div>
   <h2>{p.title||'研究报告'}</h2><p className="meta">截止 {date(p.as_of||report.created_at)}（北京时间）{p.coverage?.completed_sections!=null&&` · 已完成 ${p.coverage.completed_sections}/${p.coverage.total_sections} 章节`}</p>
   {(p.validation_warnings?.length>0||p.unverified?.length>0)&&<p className="help">部分内容待核实，详见「来源与核验」。</p>}
   <div className="reader-summary"><h3>研究摘要</h3><p className="chapter-text">{lead||'报告未提供摘要，请查看章节。'}</p>{rest&&<details><summary>展开摘要</summary><p className="chapter-text">{rest}</p></details>}</div>

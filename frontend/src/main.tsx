@@ -12,7 +12,7 @@ import {FeedbackDock} from './FeedbackDock';
 
 type Security = {id?:string; exchange:string; ticker:string; name:string; currency?:string};
 type Data = {
-  csrf:string; portfolio:any; news?:any[];
+  csrf:string; active_jobs?:any[]; portfolio:any; news?:any[];
   followed:Security[];watchlist:Security[];alerts:any[];brief:any;reports:any[];settings:any;budget:any;
   connections:{kimi:boolean;push:boolean;secure_persistence:boolean};events:any[];notifications:any[];
 };
@@ -24,6 +24,8 @@ const sidOf = (s:Security) => s.id || s.exchange+':'+s.ticker;
 function App(){
   const [data,setData]=useState<Data|null>(null),[page,setPage]=useState('home');
   const [error,setError]=useState(''),[notice,setNotice]=useState(''),[pending,setPending]=useState('');
+  const [largeText,setLargeText]=useState(localStorage.getItem('wealth-large-text')==='yes');
+  useEffect(()=>{document.documentElement.classList.toggle('large-text',largeText);localStorage.setItem('wealth-large-text',largeText?'yes':'no');},[largeText]);
   const [hidden,setHidden]=useState(localStorage.getItem('wealth-visible')!=='yes');
   const [selected,setSelected]=useState(''),[report,setReport]=useState<any>(null);
   const [query,setQuery]=useState(''),[found,setFound]=useState<Security[]>([]);
@@ -44,12 +46,13 @@ function App(){
     const result=await response.json();
     if(!response.ok){
       const detail=result.detail;
-      throw new Error(typeof detail==='string'?detail:Array.isArray(detail)?detail.map((x:any)=>x.msg).join('；'):'操作未完成，请重试。');
+      const failure:any=new Error(typeof detail==='string'?detail:Array.isArray(detail)?detail.map((x:any)=>x.msg).join('；'):'操作未完成，请重试。');failure.status=response.status;throw failure;
     }return result;
   }
   async function load(){
     const d=await api('/bootstrap');setData(d);setConfig((old:any)=>old||d.settings);
     setSelected(old=>d.followed.some((s:Security)=>s.id===old)?old:(d.followed[0]?.id||''));
+    setTask(current=>current|| (d.active_jobs?.length?{id:d.active_jobs[0].id,label:'恢复任务',detail:d.active_jobs[0].message}:null));
     return d;
   }
   useEffect(()=>{load().catch(e=>setError(e.message));},[]);
@@ -68,8 +71,9 @@ function App(){
   },[]);
   useEffect(()=>{
     if(!task)return;
-    let active=true;
+    let active=true,inFlight=false;
     const timer=setInterval(async()=>{
+      if(inFlight)return;inFlight=true;
       try{
         const j=await api('/jobs/'+task.id);
         if(!active)return;
@@ -83,16 +87,16 @@ function App(){
         }
         if(j.status==='cancelling')setTask(current=>current?.id===task.id?{...current,cancelling:true,detail:j.message}:current);
         if(j.status==='cancelled'){clearInterval(timer);const fresh=await load();if(active){setTask(null);setCompletedResult(null);setReport((current:any)=>current?.preview&&current.job_id===task.id?null:current);setNotice('已取消，本次报告与草稿未保存。');}return;}
-        if(j.status==='done'||j.status==='failed'){
+        if(j.status==='done'||j.status==='partial'||j.status==='failed'){
           clearInterval(timer);await load();
           if(j.status==='failed'){setError(j.message);setReport((current:any)=>current?.preview&&current.job_id===task.id?{...current,previewFailed:true}:current);}
           else {
             if(j.result_id){const r=await api('/reports/'+j.result_id);if(active)setCompletedResult(r);if(active&&r.kind==='news_analysis'){setPage('home');}else if(active){setReport(r);if(r.security_id)setSelected(r.security_id);if(r.kind!=='brief')setPage(r.kind==='portfolio'?'portfolio':'research');}}
-            if(active)setNotice((task.completion||'任务已完成并保存。')+' · 100%');
+            if(active)setNotice(j.status==='partial'?j.message+'，已有内容已保存。':(task.completion||'任务已完成并保存。')+' · 100%');
           }
           if(active)setTask(null);
         }
-      }catch(e:any){if(active){setError(e.message);setTask(null);clearInterval(timer);}}
+      }catch(e:any){if(active){if(e.status===404){setTask(null);setError('任务记录不存在，请检查是否切换了数据目录。');clearInterval(timer);}else setTask(current=>current?.id===task.id?{...current,detail:'连接暂时中断，正在恢复任务状态…'}:current);}}finally{inFlight=false;}
     },900);
     return()=>{active=false;clearInterval(timer)};
   },[task?.id]);
@@ -253,15 +257,15 @@ function App(){
           </form><div className="button-row small-actions"><button className="text-button" disabled={disabled} onClick={()=>action('清除密钥',async()=>{await api('/credentials','PUT',{clear_kimi:true});await load();setNotice('Kimi 密钥已清除；环境变量配置需另行移除。');})}>清除 Kimi 密钥</button><button className="text-button" disabled={disabled} onClick={()=>action('清除密钥',async()=>{await api('/credentials','PUT',{clear_push:true});await load();setNotice('推送密钥已清除；环境变量配置需另行移除。');})}>清除推送密钥</button></div>
         </section>
         <details className="maintenance-group"><summary>导入持仓与交易流水</summary><AccountTools job={job} api={api} action={action} load={load} disabled={disabled} settings={config||data.settings}/></details>
-        {config&&<section className="form-section"><h2>更新、提醒与费用</h2><form onSubmit={e=>{e.preventDefault();action('保存设置',async()=>{const times=Array.from(new Set((config.daily_times||[config.daily_time]).map(normalizeBriefTime))).sort();const settings={...config,daily_times:times,daily_time:times[0]};const saved=await api('/settings','PUT',settings);setConfig(saved.settings||settings);await load();setNotice('设置已保存。电脑开机联网时后台按规则工作。');})}}>
+        {config&&<section className="form-section"><h2>更新、提醒与费用</h2><p className="help">{data.settings.model_sync?.message||'模型费率按内置配置估算，以平台账单为准。'}{data.settings.pricing_version&&' 费率版本：'+data.settings.pricing_version} 搜索与抓取按内置费率估算；调用结果不明时保留费用预留。</p><form onSubmit={e=>{e.preventDefault();action('保存设置',async()=>{const times=Array.from(new Set((config.daily_times||[config.daily_time]).map(normalizeBriefTime))).sort();const settings={...config,daily_times:times,daily_time:times[0]};const saved=await api('/settings','PUT',settings);setConfig(saved.settings||settings);await load();setNotice('设置已保存。电脑开机联网时后台按规则工作。');})}}>
           <p className="help">模型与费率自动获取，粘贴 Kimi API 密钥即可使用。</p><div className="form-grid">
             {[['monthly_limit','每月上限（元，最多200）'],['other_service_cost','其他服务月费（推送、数据等，元）'],['concentration','单股关注阈值（%）'],['move_threshold','价格变化阈值（%）']].map(([key,label])=><label key={key}>{label}<input type="number" step={key==='weekly_research_limit'?'1':'0.01'} min="0" required value={config[key]??'0'} onChange={e=>setConfig({...config,[key]:e.target.value})}/></label>)}
           </div><BriefTimesInput values={config.daily_times||[config.daily_time]} onChange={daily_times=>setConfig({...config,daily_times})}/><label>报价来源<select value={config.quote_provider||'public'} onChange={e=>setConfig({...config,quote_provider:e.target.value})}><option value="public">公开行情（可能延迟，按报价时间判断）</option><option value="futu">富途本地OpenD（需账号行情权限）</option></select></label>{[['online_research','研究时自动联网检索与补充资料'],['scheduler_enabled','启用定时收集（每30分钟）与每日简报'],['scheduler_paused','暂停开始新的定时任务（当前任务可完成）'],['push_enabled','启用微信推送（需绑定接收者）'],['auto_research','日报中启用 AI 原文分析（会产生费用）'],['event_research','新增重大资料时更新研究论点（会产生费用）']].map(([key,label])=><label className="check-label" key={key}><input type="checkbox" checked={!!config[key]} onChange={e=>setConfig({...config,[key]:e.target.checked})}/><span>{label}</span></label>)}
-          <details className="model-settings"><summary>模型连接状态</summary><p className="help">当前模型：{config.model} · {config.model_sync?.status==='ready'?'已自动同步':config.model_sync?.status==='cached_rates'?'使用上次核实费率':'待自动核实'}</p>{config.model_sync?.message&&<p className="help">{config.model_sync.message}</p>}{config.model_sync?.checked_at&&<p className="help">最近检查：{stamp(config.model_sync.checked_at)}</p>}</details>
+          <details className="model-settings"><summary>模型连接状态</summary><p className="help">当前模型：{config.model} · {config.model_sync?.status==='ready'?'已自动同步':config.model_sync?.status==='cached_rates'?'使用已保存或内置费率':'待自动核实'}</p>{config.model_sync?.message&&<p className="help">{config.model_sync.message}</p>}{config.model_sync?.checked_at&&<p className="help">最近检查：{stamp(config.model_sync.checked_at)}</p>}</details>
           <p className="help">费用按返回用量估算，以平台账单为准；超时保留预留费用。</p><button className="primary" disabled={disabled}>保存设置</button>
         </form><div className="budget-line"><span>{data.budget.month} 本机费用估算（含服务月费）：<strong>¥{fmt(data.budget.used)}</strong> / ¥{fmt(data.budget.limit)}</span>{data.budget.warning&&<strong className="loss">已达到预算的 80%</strong>}</div></section>}
         <details className="maintenance-group"><summary>备份与运行记录</summary><section className="form-section"><div className="section-title"><h2>维护与备份</h2><a className="secondary" href="/api/backup" download><Download size={18}/>下载数据库备份</a></div><p className="help">备份含个人资产与资料，不含密钥，请妥善保存。恢复需先停止程序，按 README 操作。</p>
-          <div className="button-row"><button className="secondary" disabled={disabled} onClick={()=>action('更新资料',()=>job('/quotes/refresh','更新报价'))}>更新行情</button><button className="secondary" disabled={disabled} onClick={()=>action('推送日报',()=>job('/brief','整理并推送日报',{send:true}))}>整理并推送今日简报</button></div><h3>最近运行记录</h3>{data.events.length?data.events.map(e=><div className="log-row" key={e.id}><small>{stamp(e.created_at)}</small><span>{e.message}</span></div>):<p className="muted">尚无运行记录。</p>}<h3>最近推送</h3>{data.notifications.length?data.notifications.map(n=><div className="log-row" key={n.id}><small>{stamp(n.created_at)}</small><span>{n.title} · {n.message}</span></div>):<p className="muted">尚未发送消息。</p>}
+          <div className="button-row"><button className="secondary" disabled={disabled} onClick={()=>action('更新资料',()=>job('/quotes/refresh','更新报价'))}>更新行情</button><button className="secondary" disabled={disabled} onClick={()=>action('推送日报',()=>job('/brief','整理并推送日报',{send:true}))}>整理并推送今日简报</button></div><h3>最近运行记录</h3>{data.events.length?data.events.map(e=><div className="log-row" key={e.id}><small>{stamp(e.created_at)}</small><span>{e.message}</span></div>):<p className="muted">尚无运行记录。</p>}<label className="check-row"><input type="checkbox" checked={largeText} onChange={e=>setLargeText(e.target.checked)}/>大字号</label><h3>最近推送</h3>{data.notifications.length?data.notifications.map(n=><div className="log-row" key={n.id}><small>{stamp(n.created_at)}</small><span>{n.title} · {n.message}</span>{n.status!=='sending'&&<button className="secondary" disabled={disabled} onClick={()=>{if(window.confirm('重新发送这条已保存消息？如果之前已收到，可能重复收件。'))void action('重发消息',()=>job('/notifications/'+n.id+'/resend','重发已保存消息',{confirm:true}));}}>重发</button>}</div>):<p className="muted">尚未发送消息。</p>}
         </section></details><details className="maintenance-group"><summary>手动修正行情</summary><section className="form-section"><h2>补录行情</h2><p className="muted">数据源不可用时，可录入带日期和来源的报价。不会被标为自动核实数据。</p><form onSubmit={e=>{const f:any=formValues(e);const sid=f.sid;delete f.sid;if(!f.previous)delete f.previous;action('保存报价',async()=>{await api('/quotes/'+encodeURIComponent(sid),'POST',f);await load();setNotice('手动报价已保存。');})}}>
           <label>公司<select name="sid" required><option value="">请选择</option>{data.followed.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}</select></label><div className="form-grid"><label>每股价格<input name="price" type="number" min="0.000001" step="0.000001" required/></label><label>前一交易日价格（选填）<input name="previous" type="number" min="0.000001" step="0.000001"/></label><label>报价日期<input name="as_of" type="date" defaultValue={today()} max={today()} required/></label><label>报价来源<input name="source" minLength={2} required placeholder="如券商行情页面"/></label></div><button className="secondary" disabled={disabled}>保存报价</button>
         </form></section></details>
